@@ -1,0 +1,180 @@
+{
+  "id": "high_temperature_high_entropy_alloy",
+  "short_name": "hea",
+  "name": "航空航天热端部件用耐高温高熵合金带材",
+  "version": "catalog-v1.12",
+  "composition_unit": "wt_pct",
+  "elements": [
+    "Ag",
+    "Al",
+    "B",
+    "C",
+    "Ca",
+    "Co",
+    "Cr",
+    "Cu",
+    "Fe",
+    "Gd",
+    "Hf",
+    "Ho",
+    "La",
+    "Li",
+    "Mg",
+    "Mn",
+    "Mo",
+    "N",
+    "Nb",
+    "Ni",
+    "O",
+    "P",
+    "Pd",
+    "S",
+    "Sc",
+    "Si",
+    "Sn",
+    "Ta",
+    "Ti",
+    "V",
+    "W",
+    "Zn",
+    "Zr"
+  ],
+  "balance": null,
+  "protocol": {},
+  "metrics": [
+    {
+      "key": "density",
+      "label": "密度ρ",
+      "unit": "g/cm3",
+      "direction": "min",
+      "target": 8.2,
+      "op": "<=",
+      "role": "measurement"
+    },
+    {
+      "key": "room_temperature_tensile_strength",
+      "label": "室温抗拉强度Rm",
+      "unit": "MPa",
+      "direction": "max",
+      "target": 1100,
+      "op": ">=",
+      "role": "measurement"
+    },
+    {
+      "key": "room_temperature_fracture_elongation",
+      "label": "室温断后延伸率A",
+      "unit": "%",
+      "direction": "max",
+      "target": 8,
+      "op": ">=",
+      "role": "measurement"
+    },
+    {
+      "key": "yield_strength_700C",
+      "label": "700℃屈服强度Rp0.2",
+      "unit": "MPa",
+      "direction": "max",
+      "target": 600,
+      "op": ">=",
+      "role": "measurement"
+    },
+    {
+      "key": "fracture_elongation_700C",
+      "label": "700℃断后延伸率A",
+      "unit": "%",
+      "direction": "max",
+      "target": 15,
+      "op": ">=",
+      "role": "measurement"
+    },
+    {
+      "key": "reported_elongation",
+      "label": "指定测试温度下报告延伸率EL（非断后A验收）",
+      "unit": "%",
+      "direction": "max",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    },
+    {
+      "key": "reported_yield_strength",
+      "label": "指定测试温度下报告YS（MPa，研究筛选）",
+      "unit": "MPa",
+      "direction": "max",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    },
+    {
+      "key": "reported_tensile_strength",
+      "label": "指定测试温度下报告UTS（MPa，研究筛选）",
+      "unit": "MPa",
+      "direction": "max",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    },
+    {
+      "key": "reported_density",
+      "label": "报告密度（测量温度未知，非实测验收）",
+      "unit": "g/cm3",
+      "direction": "min",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    }
+  ],
+  "tools": [
+    {
+      "id": "hea-reported-density-nist38-lightgbm",
+      "version": "hea-reported-density-nist38-v1-20261026",
+      "purpose": "报告密度诊断；另列理想体积公式参考",
+      "kind": "property",
+      "asset": "steel_forest/data/models/hea_density_nist38_20261026/binding.json"
+    },
+    {
+      "id": "hea-reported-yield-strength-lightgbm",
+      "version": "hea-strength-ratio-v1-20261022",
+      "purpose": "指定工艺和测试温度下的报告 YS",
+      "kind": "property",
+      "asset": "steel_forest/data/models/hea_strength_ratio_20261022/YS/binding.json"
+    },
+    {
+      "id": "hea-reported-tensile-strength-lightgbm",
+      "version": "hea-strength-ratio-v1-20261022",
+      "purpose": "指定工艺和测试温度下的报告 UTS",
+      "kind": "property",
+      "asset": "steel_forest/data/models/hea_strength_ratio_20261022/UTS/binding.json"
+    },
+    {
+      "id": "hea-reported-elongation-lightgbm",
+      "version": "hea-el-le700-v1-20261023",
+      "purpose": "指定工艺和测试温度下的报告 EL",
+      "kind": "property",
+      "asset": "steel_forest/data/models/hea_elongation_le700_20261023/binding.json"
+    }
+  ],
+  "limitations": [
+    "四工具均只报告诊断，不用于候选池评分、合同阈值筛除或验收通过判断。",
+    "显式声明完整 wt.% 成分、protocol.process_text 和 protocol.testing.test_temperature_C；工艺未知应明说未知。",
+    "测试温度限 0–700 °C；研究室温参考可选 25 °C，合同室温定义仍需确认；无默认温度。",
+    "报告 EL 混合定义，不能等同断后延伸率 A；700 °C EL 验证不足以支持排序。",
+    "密度测量温度未知；理想体积公式是模型特征，不能作为第二份独立证据。",
+    "仅研究成分；工艺作为比较和预测条件，不扩大为加工过程优化。"
+  ],
+  "element_note": "四工具共同支持的输入元素集合；本次研究的元素集合与范围必须另行声明，这不是推荐配方。",
+  "literature_tools": [
+    {
+      "id": "lkm_claim_search",
+      "version": "api-v2",
+      "purpose": "检索文献主张和来源线索",
+      "kind": "literature"
+    },
+    {
+      "id": "dprag_context_search",
+      "version": "api-v1",
+      "purpose": "检索文献上下文和来源线索",
+      "kind": "literature"
+    }
+  ]
+}

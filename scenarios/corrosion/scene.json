@@ -1,0 +1,131 @@
+{
+  "id": "fixed_wheel_cyclic_immersion",
+  "short_name": "corrosion",
+  "name": "低合金耐蚀钢：固定轮周浸",
+  "version": "catalog-v3",
+  "composition_unit": "wt_pct",
+  "elements": [
+    "Fe",
+    "C",
+    "Si",
+    "Mn",
+    "P",
+    "S",
+    "Cr",
+    "Ni",
+    "Cu",
+    "Mo",
+    "Nb",
+    "V",
+    "Ti",
+    "Sb",
+    "Sn",
+    "Al"
+  ],
+  "balance": "Fe",
+  "protocol": {
+    "solution_temperature_c": 45.0,
+    "ambient_temperature_c": 34.0,
+    "ambient_humidity_pct": 63.0,
+    "exposure_time_h": 168.0,
+    "nacl_wt_pct": 0.5,
+    "sample_dimension_1_mm": 60.0,
+    "sample_dimension_2_mm": 40.0,
+    "sample_dimension_3_mm": 6.0,
+    "protocol_kind": "fixed_wheel_cyclic_immersion"
+  },
+  "metrics": [
+    {
+      "key": "cumulative_corrosion_loss_um",
+      "label": "累计金属损失等效厚度",
+      "unit": "um",
+      "direction": "min",
+      "target": null,
+      "op": null,
+      "role": "screening",
+      "qualification": "model_diagnostic_not_physical_acceptance",
+      "ranking": {
+        "allowed": true,
+        "qualification": "nominal_research_ordering_with_same_composition_basis_and_protocol",
+        "physical_threshold_qualified": false,
+        "source_path": "steel_forest/data/scenarios/catalog.json",
+        "source_field": "registry.definitions[0].metadata.profile.objective_specs[0]"
+      }
+    },
+    {
+      "key": "relative_corrosion_vs_q345b_gold",
+      "label": "相对Q345B实测腐蚀量（需实测或审查后的物理换算）",
+      "unit": "ratio",
+      "direction": "min",
+      "target": 0.5,
+      "op": "<=",
+      "role": "measurement"
+    },
+    {
+      "key": "saving_vs_3ni_yuan_per_t",
+      "label": "相对3Ni成本节省",
+      "unit": "yuan/t",
+      "direction": "max",
+      "target": 1500,
+      "op": ">=",
+      "role": "screening"
+    },
+    {
+      "key": "yield_strength_mpa",
+      "label": "屈服强度",
+      "unit": "MPa",
+      "direction": "max",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    },
+    {
+      "key": "tensile_strength_mpa",
+      "label": "抗拉强度",
+      "unit": "MPa",
+      "direction": "max",
+      "target": null,
+      "op": null,
+      "role": "diagnostic"
+    },
+    {
+      "key": "elongation_pct",
+      "label": "延伸率",
+      "unit": "%",
+      "direction": "max",
+      "target": 20,
+      "op": ">",
+      "role": "screening"
+    }
+  ],
+  "tools": [
+    {
+      "id": "material_candidate_evaluation",
+      "version": "v3-ni-gated-20261026",
+      "purpose": "Ni 分段四专家腐蚀预测、固定基准成本与 CorrMP-v1 力学诊断",
+      "kind": "property",
+      "model": "MODEL-cyclic-cumulative-ni-gated-ensemble-20261026_151438",
+      "asset": "steel_forest/data/models/corrosion_ni_gated_20261026/BINDING.json"
+    }
+  ],
+  "limitations": [
+    "累计金属损失厚度 μm 用于研究排序；相对 Q345B 实测质量损失比 ≤0.5 需实测或绑定物理换算。",
+    "成本是固定价格基准的估计；延伸率筛选目标严格 >20%。",
+    "CorrMP-v1 使用固定模型参考工艺，它不是候选已知制造工艺；制造工艺不在本场景内优化。",
+    "预测不构成材料实测验收；元素边际覆盖不证明联合成分适用性。"
+  ],
+  "literature_tools": [
+    {
+      "id": "lkm_claim_search",
+      "version": "api-v2",
+      "purpose": "检索文献主张和来源线索",
+      "kind": "literature"
+    },
+    {
+      "id": "dprag_context_search",
+      "version": "api-v1",
+      "purpose": "检索文献上下文和来源线索",
+      "kind": "literature"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+recycle_bin/
+
+# 用户研究状态与产物保存在本机。
+forest/canonical.json
+forest/canonical.lock
+forest/canonical.tmp
+forest/sources/
+outputs/*/
+
+# 本地工具与模型资产不进入源码仓库。
+.venv/
+.pytest_cache/
+*.log

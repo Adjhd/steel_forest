@@ -1,0 +1,258 @@
+{
+  "id": "weak_field_nonmagnetic_plate",
+  "short_name": "nonmagnetic",
+  "name": "弱场奥氏体无磁钢板",
+  "version": "catalog-v1.2",
+  "composition_unit": "wt_pct",
+  "elements": [
+    "Fe",
+    "C",
+    "Si",
+    "Mn",
+    "P",
+    "S",
+    "Cr",
+    "Ni",
+    "Cu",
+    "Mo",
+    "Nb",
+    "V",
+    "Ti",
+    "Sb",
+    "Sn",
+    "Al",
+    "Zn",
+    "Mg",
+    "Re",
+    "N"
+  ],
+  "balance": "Fe",
+  "protocol": {
+    "protocol_kind": "magnetic.remanence_and_permeability",
+    "remanence_distance_cm": 2.0,
+    "remanence_target_nT": 0.5,
+    "relative_permeability_target": 1.02
+  },
+  "metrics": [
+    {
+      "key": "stray_field_at_2cm_nT",
+      "label": "距钢2 cm的项目弱磁指标",
+      "unit": "nT",
+      "direction": "min",
+      "target": 0.5,
+      "op": "<=",
+      "role": "measurement"
+    },
+    {
+      "key": "relative_permeability_measured",
+      "label": "相对磁导率",
+      "unit": "1",
+      "direction": "min",
+      "target": 1.02,
+      "op": "<=",
+      "role": "measurement"
+    },
+    {
+      "key": "remanence",
+      "label": "模型材料剩磁Br",
+      "unit": "T",
+      "direction": "min",
+      "target": null,
+      "op": null,
+      "role": "screening",
+      "qualification": "model_diagnostic_not_physical_acceptance",
+      "ranking": {
+        "allowed": true,
+        "qualification": "nominal_research_ordering_with_same_composition_basis_and_protocol",
+        "physical_threshold_qualified": false,
+        "source_path": "steel_forest/data/scenarios/catalog.json",
+        "source_field": "registry.definitions[1].metadata.profile.objective_specs[0]"
+      }
+    },
+    {
+      "key": "relative_permeability",
+      "label": "模型相对磁导率诊断",
+      "unit": "dimensionless",
+      "direction": "min",
+      "target": null,
+      "op": null,
+      "role": "screening",
+      "qualification": "model_diagnostic_not_physical_acceptance",
+      "ranking": {
+        "allowed": true,
+        "qualification": "nominal_research_ordering_with_same_composition_basis_and_protocol",
+        "physical_threshold_qualified": false,
+        "source_path": "steel_forest/data/scenarios/catalog.json",
+        "source_field": "registry.definitions[1].metadata.profile.objective_specs[1]"
+      }
+    },
+    {
+      "key": "yield_strength",
+      "label": "屈服强度",
+      "unit": "MPa",
+      "direction": "max",
+      "target": 500,
+      "op": ">=",
+      "role": "screening"
+    },
+    {
+      "key": "tensile_strength",
+      "label": "抗拉强度",
+      "unit": "MPa",
+      "direction": "max",
+      "target": 800,
+      "op": ">=",
+      "role": "screening"
+    },
+    {
+      "key": "elongation",
+      "label": "延伸率",
+      "unit": "%",
+      "direction": "max",
+      "target": 30,
+      "op": ">=",
+      "role": "screening"
+    },
+    {
+      "key": "yield_to_tensile_ratio",
+      "label": "屈强比",
+      "unit": "dimensionless",
+      "direction": "min",
+      "target": 0.85,
+      "op": "<",
+      "role": "screening"
+    },
+    {
+      "key": "pren",
+      "label": "PREN诊断",
+      "unit": "dimensionless",
+      "direction": "max",
+      "target": 20,
+      "op": ">",
+      "role": "screening"
+    }
+  ],
+  "tools": [
+    {
+      "id": "property-lgbm-v1-remanence",
+      "version": "v1",
+      "purpose": "材料剩磁 Br（T）诊断",
+      "kind": "property",
+      "asset": "nonmagnetic_steel_coscientist/data/models/magnetic_properties_v1/剩磁.joblib"
+    },
+    {
+      "id": "property-lgbm-v1-relative-permeability",
+      "version": "v1",
+      "purpose": "相对磁导率诊断",
+      "kind": "property",
+      "asset": "nonmagnetic_steel_coscientist/data/models/magnetic_properties_v1/相对磁导率.joblib"
+    },
+    {
+      "id": "nms-plate-mechanical",
+      "version": "20261021_135640",
+      "purpose": "YS / UTS / EL，并派生 YS/UTS 与 PREN",
+      "kind": "property",
+      "asset": "steel_forest/data/models/nms_plate_20261021/binding.json"
+    }
+  ],
+  "limitations": [
+    "材料 Br（T）不能替代距试样 2 cm 的场强（nT）；模型 μr 不具备 ≤1.02 的实测验收资格。",
+    "力学条件通过 protocol.mechanical_conditions 声明，未知项保持未知，不自动假定室温或工艺。",
+    "PREN=Cr+3.3Mo+16N 是成分描述符，高 Mn/Al 域适用性未知。",
+    "磁性模型仅有 14 个独立元素特征；力学模型中 Sb/Sn/Zn/Mg/Re 无独立输入，Fe 余量响应不能证明它们的作用。",
+    "板材模型独立成分组有限，EL 组外验证较弱，高 Al/N 联合域支持不足；成本当前不可用。"
+  ],
+  "reference_ranges_wt_pct": {
+    "C": [
+      0,
+      0.5
+    ],
+    "Si": [
+      0,
+      1
+    ],
+    "Mn": [
+      3,
+      25
+    ],
+    "P": [
+      0,
+      0.03
+    ],
+    "S": [
+      0,
+      0.02
+    ],
+    "Cr": [
+      5,
+      20
+    ],
+    "Ni": [
+      0,
+      6
+    ],
+    "Mo": [
+      0,
+      5
+    ],
+    "Nb": [
+      0,
+      0.5
+    ],
+    "V": [
+      0,
+      0.5
+    ],
+    "N": [
+      0,
+      0.6
+    ],
+    "Cu": [
+      0,
+      2
+    ],
+    "Ti": [
+      0,
+      0.5
+    ],
+    "Sb": [
+      0,
+      0.2
+    ],
+    "Sn": [
+      0,
+      0.2
+    ],
+    "Al": [
+      0,
+      6
+    ],
+    "Zn": [
+      0,
+      0.05
+    ],
+    "Mg": [
+      0,
+      0.05
+    ],
+    "Re": [
+      0,
+      0.1
+    ]
+  },
+  "range_note": "仅为已有任务参考窗；每次 campaign 必须显式采纳或重新提供范围。",
+  "literature_tools": [
+    {
+      "id": "lkm_claim_search",
+      "version": "api-v2",
+      "purpose": "检索文献主张和来源线索",
+      "kind": "literature"
+    },
+    {
+      "id": "dprag_context_search",
+      "version": "api-v1",
+      "purpose": "检索文献上下文和来源线索",
+      "kind": "literature"
+    }
+  ]
+}
