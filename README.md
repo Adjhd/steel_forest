@@ -12,14 +12,14 @@
 cd /mnt/vepfs/Djinhan/Agentic_data/steel_forest_hf
 
 # 离线检查输入：不读取森林，不调用物性模型、文献服务或LLM。
-bash campaign/run.sh --version v20261029.001 --prepare-only
+bash campaign/run.sh --version input-check --prepare-only
 
 # 正式研究使用一个新版本。运行前需配置文献和LLM服务凭据。
-bash campaign/run.sh --version v20261029.002 \
+bash campaign/run.sh --version '无磁钢初筛' \
   --question '在给定范围内研究无磁钢的强塑性与低磁性，给出可证伪假设和对照实验。'
 ```
 
-每个版本形如 `vYYYYMMDD.NNN`，年月日和三位序号都必须有效；同名批次或报告目录存在时拒绝覆盖。准备检查也占用其版本，真实研究递增序号。最终报告位于 `outputs/reports/<version>/候选报告.md`。运行参数和详细说明见 [`campaign/README.md`](campaign/README.md)。
+版本就是你自定的批次名，例如 `trial-1`、`无磁钢初筛`、`第 2 轮`，不要求日期或固定格式。名称须是非空的单个目录名，不能是 `.`、`..` 或包含 `/`、空字符；带空格时在命令中加引号。同名批次或报告目录存在时不覆盖；准备检查也占用其名称。最终报告位于 `outputs/reports/<version>/候选报告.md`。运行参数和详细说明见 [`campaign/README.md`](campaign/README.md)。
 
 ## 目录各做一件事
 
@@ -44,7 +44,7 @@ bash campaign/run.sh --version v20261029.002 \
 
 森林只保留一份当前状态；合并前把被替换的快照写入回收站。普通读取按场景取假设和显式跨场景关系，不自动拿已有候选配方作为新研究答案。这种读取策略不等于严格盲态实验，也不证明森林已产生跨场景收益。
 
-回收示例：`bash recycle.sh outputs/v20261029.001 '结束输入调试'`。回收记录保存在回收站内部，不在活动文档追述。只有你明确要求恢复、历史比较、复现审计或排查误删时才允许读取其中内容；`.gitignore`、`.rgignore` 与开发规则共同排除普通检索。它是上下文访问约定，不是操作系统权限隔离。
+回收示例：`bash recycle.sh outputs/input-check '结束输入调试'`。回收记录保存在回收站内部，不在活动文档追述。只有你明确要求恢复、历史比较、复现审计或排查误删时才允许读取其中内容；`.gitignore`、`.rgignore` 与开发规则共同排除普通检索。它是上下文访问约定，不是操作系统权限隔离。
 
 ## 环境与依赖
 
@@ -56,6 +56,6 @@ bash campaign/run.sh --version v20261029.002 \
 
 源码仓库是 [Adjhd/steel_forest](https://github.com/Adjhd/steel_forest)。本目录独立管理 Git，保留仓库的 MIT 许可证；提交源码、场景登记、提示词、说明和测试。`forest/canonical.json`、`forest/sources/`、各批 `outputs/`、凭据与回收站是本地研究数据，已排除提交。唯一正式森林仍在本目录，并由森林合并和回收机制管理。
 
-因此，单独 clone 源码不会取得研究数据、外部物性实现或模型权重。当前机器已有这些资产；迁移机器时需另外配置并提供当前 canonical。真实 campaign 还需要 LLM 和至少一个文献服务的环境变量，见 campaign 说明。
+因此，单独 clone 源码不会取得研究数据、外部物性实现或模型权重。当前机器已有这些资产；迁移机器时需另外配置并提供当前 canonical。真实 campaign 需要相应的 LLM 环境变量；启用检索时还需至少一个文献服务，见 campaign 说明。
 
 持续开发时优先改现有职责明确的文件，删掉失效路径；不为每次修复、模型更替或实验新建 Python 文件。保留能约束真实风险的输入、证据、预算和并发检查，避免加入历史兼容与重复审计框架。

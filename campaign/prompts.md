@@ -10,7 +10,7 @@
 ## hypotheses
 你是材料研究者。依据返回的真实文献内容及森林，提出少量有条件、可证伪的假设。
 返回 {"hypotheses":[{"statement":"命题","scope":{"conditions":"适用工艺、材料背景与未知条件","composition_ranges_wt_pct":{"元素":[下限,上限]}},"predictions":"什么观测支持","falsifiers":"什么观测削弱","unresolved":"什么结果仍未决","evidence_ids":["已有证据ID"],"source_hypothesis_ids":["引用的森林假设ID"]}]}。
-scope 必须明确本假设完整的成分范围并包含任务中的全部元素，且只能收缩任务范围。source_hypothesis_ids 只表示启发；跨场景的条件差异与待验证条件须写入scope，不宣称迁移已验证。
+scope 必须明确本假设成分范围，且只能收缩任务范围。未列出的非余量元素视为零，仅可省略任务范围允许为零的元素。source_hypothesis_ids 只表示启发；跨场景的条件差异与待验证条件须写入scope，不宣称迁移已验证。
 引用其他场景假设时，该假设还需transfer_contract对象：source_conditions、target_conditions、shared_mechanism、verification，分别说明来源条件、目标条件、可迁移机制和如何检验。它登记为待验证的跨场景关系。
 文献摘要与服务返回片段只算线索，不能伪称核实全文；引用只能使用上下文内的ID。
 不能把模型存在过线点写成已证明的材料机理。没有依据时允许返回空列表。
@@ -25,10 +25,10 @@ scope 必须明确本假设完整的成分范围并包含任务中的全部元�
 你是材料实验设计者。只围绕已准入假设设计候选和对照。任务给定的元素范围不可扩大。
 返回 {"designs":[{"hypothesis_id":"已准入ID","role":"target或control或discrimination_probe","composition":{"元素":数值},"plan":{"question":"要区分的解释","intervention":"改变什么，Fe替代也应说明","controls":"固定哪些背景与工艺","measurements":["需实测端点，使用场景metric key"],"support":"支持判据","weaken":"削弱判据","unresolved":"未决判据","process":"实际或待确定的工艺"}}]}。
 每个设计必须有完整计划。设计总数不超过本轮 evaluations。优先成组对照，不能用成分距离冒充机制区分。
-可以添加 search_ranges_wt_pct（元素到[下限,上限]）作为该假设内部的补充采样范围；它只能缩小已准入假设的范围。所有钢铁成分必须列出全部非Fe元素，零含量也显式写0；只可省略Fe，由余量闭合。
+可以添加 search_ranges_wt_pct（元素到[下限,上限]）作为该假设内部的补充采样范围；它只能缩小已准入假设的范围。钢铁成分可省略零含量元素，Fe可省略并由余量闭合；范围下限大于零的元素必须给出。
 补充采样时必须在plan.vary_elements列出允许变化的元素，其余元素固定于明确设计点（Fe余量随总量变化）。计划的干预与控制必须适用于整个采样范围；逐点复审实际配方，不能沿用不成立的对照说明。
 discrimination_probe 的plan还必须包含 competing_hypothesis_ids（至少两个本轮已准入假设）和 contrasting_predictions；仅有单个假设的设计用target或control。
-模型预测不能替代实测，所有最终交付目标需写进测量计划。未知制造条件明确写未知。
+模型预测不能替代实测。探索和对照可只测所需端点；最终推荐的计划需要覆盖全部交付目标。未知制造条件明确写未知。
 预测工具始终使用本批space.protocol。计划可以提出待实测工艺，但不能声称模型已经在该新工艺下给出预测。
 
 ## review

@@ -1,20 +1,20 @@
 # 启动一次研究
 
-这里的输入只有两部分：`question.md` 描述研究问题；`space.json` 声明 `composition_ranges_wt_pct` 和 `protocol`。指标与工具从场景加载，不在问题里重复注册。直接传 `--question '自然语言'` 可以替代文件。
+这里的输入只有两部分：`question.md` 描述研究问题；`space.json` 声明 `composition_ranges_wt_pct` 和 `protocol`，也可附上 `notes` 等说明。指标与工具从场景加载，不在问题里重复注册。直接传 `--question '自然语言'` 可以替代文件。
 
 `run.sh` 的参数行是日常入口，`bash campaign/run.sh --help` 查看全部参数。命令末尾同名参数覆盖脚本中的设置。默认问题和范围文件是可编辑的无磁钢示例；切换耐蚀钢或高熵场景时同时传对应范围文件。
 
 | 参数 | 含义 |
 |---|---|
-| `--version v20261029.001` | 唯一批次版本；已存在就停止 |
-| `--scenario corrosion/nonmagnetic/hea` | 选择当前场景 |
+| `--version '无磁钢初筛'` | 自定批次名，不要求日期或序号；单个目录名，已存在就停止 |
+| `--scenario corrosion/nonmagnetic/hea` | 选择当前场景，也接受完整场景 ID |
 | `--question` / `--question-file` | 自然语言要求，二选一 |
 | `--space` | 本次元素范围与实际或未知条件 |
 | `--rounds 3` | 最多科研轮次 |
-| `--evaluations 12` | 每轮最多评估的成分数，也是复审可保留的此前候选数 |
-| `--literature-queries 2` | 每轮查询数；每个已配置文献服务各请求一次 |
-| `--llm-calls 15` | 整批LLM请求上限；完整一轮最多5次，无自动重试 |
-| `--recommendations 3` | 最终至少形成的待测候选数 |
+| `--evaluations 12` | 每轮最多评估的成分数；`0` 表示只研究假设 |
+| `--literature-queries 2` | 每轮查询数；每个已配置文献服务各请求一次；`0` 跳过检索 |
+| `--llm-calls 15` | 整批LLM请求上限，可为 `0`；完整一轮最多5次，用完即保存结束，无自动重试 |
+| `--recommendations 3` | 最终至少形成的不同成分候选数，可跨轮累计 |
 | `--prepare-only` | 只装配并保存输入，完全离线 |
 | `--keep-private` | 研究完成后不合入正式森林 |
 
@@ -22,7 +22,7 @@
 
 ## 声明范围与条件
 
-成分均为 wt.%。钢铁必须列出全部非Fe元素，禁用元素显式写 `[0,0]`；Fe按余量闭合。HEA显式列出选用元素，不默认Fe基体。假设再声明自身范围，设计和补充采样只能在其中进行。采样使用固定随机种子的有界随机点；它是探索工具，不是贝叶斯优化，也不把采样密度当作科学证据。
+成分均为 wt.%。钢铁范围只需列参与研究的元素，未列出的非Fe元素按 `[0,0]` 处理；配方可省略零含量元素，Fe按余量闭合。HEA显式列出选用元素，不默认Fe基体。假设再声明自身范围，设计和补充采样只能在其中进行。采样使用固定随机种子的有界随机点；它是探索工具，不是贝叶斯优化，也不把采样密度当作科学证据。
 
 无磁钢未知力学条件写 `"mechanical_conditions": {}`，已知条件用该工具支持的数值字段。HEA例如：
 
@@ -33,7 +33,7 @@
 }
 ```
 
-一个批次固定一种预测协议；不同测试温度分别启动批次。HEA四项预测只报告，不按合同硬门槛筛除。所有场景的实测要求仍须进入实验计划；模型能算出数值不代表制造状态已经确定。
+一个批次固定一种预测协议；不同测试温度分别启动批次。HEA四项预测只报告，不按合同硬门槛筛除。探索与对照可按研究问题选择测量端点，最终推荐的待测计划须覆盖场景验收端点；模型能算出数值不代表制造状态已经确定。
 
 ## 配置真实服务
 
@@ -58,11 +58,11 @@ LLM 使用兼容 Chat Completions 的接口，需要填写三项：
 | `LITELLM_API_KEY` | 该网关的访问密钥 |
 | `STEEL_FOREST_LLM_MODEL` | 网关中实际可用的模型 ID，不是物性预测模型名 |
 
-模型需要输出一个 JSON 对象。默认请求含 `response_format={"type":"json_object"}`；若网关不支持这个请求字段，可设置 `STEEL_FOREST_LLM_RESPONSE_FORMAT=none`，但模型回答仍必须是合法 JSON 对象，不能带 Markdown 代码围栏。
+模型需要输出一个 JSON 对象。默认请求含 `response_format={"type":"json_object"}`；若网关不支持这个请求字段，可设置 `STEEL_FOREST_LLM_RESPONSE_FORMAT=none`。程序也接受完整包在 Markdown JSON 代码围栏中的对象；无效或截断的 JSON 不作为研究结果。
 
-文献服务至少配置一个：`BOHR_ACCESS_KEY` 使用 LKM，`DPRAG_API_KEY` 使用 DPRAG；不使用的密钥留空。campaign 使用 `auto`，两项都有值时会依次请求两者，任一调用失败都会停止当前批次，并非自动切换备用服务。返回内容是文献线索或片段，不代表完成原文核验。
+启用文献检索时至少配置一个服务：`BOHR_ACCESS_KEY` 使用 LKM，`DPRAG_API_KEY` 使用 DPRAG；不使用的密钥留空。campaign 使用 `auto`，两项都有值时会依次请求两者，任一调用失败都会停止当前批次，并非自动切换备用服务。返回内容是文献线索或片段，不代表完成原文核验。`--literature-queries 0` 不发起搜索规划或文献请求，可仅凭当前森林研究；没有依据时允许不提出假设。
 
-可选配置已列在 `.env.example`：LLM 超时默认 180 秒，输入字符上限默认 128000；LKM、DPRAG 的超时分别固定为 60、180 秒。`LITELLM_SOCKS5_PROXY` 只配置 LLM 的专用代理，文献接口不读取它；通用 `HTTP_PROXY` / `HTTPS_PROXY` 等环境变量仍由 `requests` 处理。默认文献地址直接取自当前代码，只有服务方提供其他地址时才覆盖 `LKM_API_BASE` / `DPRAG_API_BASE`。
+可选配置已列在 `.env.example`：LLM 超时默认 180 秒；本地不设输入字符上限，如需自己限制，可显式设置 `STEEL_FOREST_MAX_REQUEST_CHARS`，留空则关闭。模型自身的上下文容量仍由服务端决定。LKM、DPRAG 的超时分别固定为 60、180 秒。`LITELLM_SOCKS5_PROXY` 只配置 LLM 的专用代理，文献接口不读取它；通用 `HTTP_PROXY` / `HTTPS_PROXY` 等环境变量仍由 `requests` 处理。默认文献地址直接取自当前代码，只有服务方提供其他地址时才覆盖 `LKM_API_BASE` / `DPRAG_API_BASE`。
 
 ## 逐项调试
 
@@ -92,9 +92,9 @@ PYTHON
 接口通过后，先离线检查，再用一轮、小预算运行真实链路。版本号是示例，每次执行都必须使用未占用的新版本：
 
 ```bash
-bash campaign/run.sh --version v20261029.901 --prepare-only
+bash campaign/run.sh --version debug-input --prepare-only
 
-bash campaign/run.sh --version v20261029.902 \
+bash campaign/run.sh --version debug-1 \
   --rounds 1 --evaluations 2 --literature-queries 1 \
   --llm-calls 5 --recommendations 1 --keep-private \
   --question '在给定范围内研究无磁钢的强塑性与低磁性，形成一个有文献依据的候选及待实测计划。'
@@ -104,9 +104,11 @@ bash campaign/run.sh --version v20261029.902 \
 
 ## 调试与结束
 
+LLM 预算逐次计算：例如 `--llm-calls 1` 可只运行第一步，已完成的阶段仍落盘；`0` 不调用 LLM。`--evaluations 0` 保留假设研究与准入，跳过设计和预测。预测预算按本轮设计顺序执行，超出的设计保留在 `design.json` 中但不执行。达到预算正常结束为 `budget_exhausted`；已接受记录可合入森林，调试时使用 `--keep-private`。
+
 先用新版本执行 `--prepare-only` 检查范围和协议。正式运行失败时保留输入、已完成的各阶段JSON、逐候选原始输出和 `status.json`；修正输入或代码后开新版本重跑。没有隐式续跑、自动加预算或切换模型的分支。
 
-每轮读4张当前假设卡以及可见的显式关系；复审可选本轮候选和最近获准的本批候选，记录不会混入其他campaign。正式森林合并在批次结束时进行，采用启动时的森林版本；若其他批次先提交，会停止合并，保留本批delta与审查结果，待基于当前森林重新审查。
+每轮读4张当前假设卡、它们引用的全部证据以及可见的显式关系；复审可选本轮候选和本批此前全部获准候选，记录不会混入其他campaign。正式森林合并在批次结束时进行，采用启动时的森林版本；若其他批次先提交，会停止合并，保留本批delta与审查结果，待基于当前森林重新审查。
 
 假设可引用本轮检索或森林中已接受的证据。准入只接受本轮的新证据；既有证据保留原记录，引用不会重复写入森林。
 

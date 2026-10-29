@@ -50,7 +50,7 @@ def context(scenario, limit=12, state=None) -> dict:
     links = [link for link in state["links"]
              if link["source"] in chosen and link["target"] in chosen]
     evidence_ids = {key for node in chosen.values() for key in node.get("evidence_ids", [])}
-    evidence = [record for key, record in state["evidence"].items() if key in evidence_ids][:limit]
+    evidence = [record for key, record in state["evidence"].items() if key in evidence_ids]
     fields = {"id", "version_id", "revision", "statement", "scope", "falsifiers",
               "predictions", "evidence_ids", "scenario", "status"}
     cards = []

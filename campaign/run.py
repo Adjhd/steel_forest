@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 from pathlib import Path
-import re
 import sys
+from urllib.parse import quote
 
 from campaign import engine, services
 from scenarios import load, validate_ranges, effective_protocol
@@ -16,15 +15,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description='Steel Forest HF：假设优先的材料研究')
-    parser.add_argument('--version', required=True, help='唯一版本，例如 v20261029.001')
-    parser.add_argument('--scenario', default='nonmagnetic', choices=['corrosion', 'nonmagnetic', 'hea'])
+    parser.add_argument('--version', required=True, help='自定批次名，例如 trial-1、无磁钢初筛；不能包含 /')
+    parser.add_argument('--scenario', default='nonmagnetic', help='corrosion/nonmagnetic/hea 或场景完整 ID')
     question = parser.add_mutually_exclusive_group()
     question.add_argument('--question', help='直接输入自然语言研究问题')
     question.add_argument('--question-file', type=Path, default=ROOT / 'campaign/question.md')
     parser.add_argument('--space', type=Path, default=ROOT / 'campaign/space.json')
     parser.add_argument('--rounds', type=int, default=3)
-    parser.add_argument('--evaluations', type=int, default=12, help='每轮最多预测的成分数')
-    parser.add_argument('--literature-queries', type=int, default=2, help='每轮文献查询数；每个已配置服务各调用一次')
+    parser.add_argument('--evaluations', type=int, default=12, help='每轮最多预测的成分数；0 表示只研究假设')
+    parser.add_argument('--literature-queries', type=int, default=2, help='每轮文献查询数；0 跳过检索，每个已配置服务各调用一次')
     parser.add_argument('--llm-calls', type=int, default=15, help='本批语言模型请求上限，不自动重试')
     parser.add_argument('--recommendations', type=int, default=3, help='最终至少交付的候选数')
     parser.add_argument('--prepare-only', action='store_true', help='仅装配输入，不读取森林、不调用模型与服务')
@@ -33,20 +32,16 @@ def arguments(argv=None):
 
 
 def configuration(args):
-    if not re.fullmatch(r'v\d{8}\.\d{3}', args.version):
-        raise ValueError('version 格式必须是 vYYYYMMDD.NNN，例如 v20261029.001')
-    datetime.strptime(args.version[1:9], '%Y%m%d')
-    for name in ('rounds', 'evaluations', 'literature_queries', 'llm_calls', 'recommendations'):
+    if not args.version.strip() or args.version in ('.', '..') or '/' in args.version or '\0' in args.version:
+        raise ValueError('version 请使用非空的单个目录名，不能是 .、.. 或包含 /、空字符')
+    for name in ('rounds', 'recommendations'):
         if getattr(args, name) < 1:
             raise ValueError(f'{name} 必须大于0')
-    if args.llm_calls < 5:
-        raise ValueError('一个完整研究轮次需要至少5次LLM请求预算')
-    if args.recommendations > args.evaluations:
-        raise ValueError('最终候选数不能超过每轮成分评估数')
+    for name in ('evaluations', 'literature_queries', 'llm_calls'):
+        if getattr(args, name) < 0:
+            raise ValueError(f'{name} 不能小于0')
     scene = load(args.scenario)
     space = json.loads(args.space.read_text())
-    if set(space) - {'composition_ranges_wt_pct', 'protocol'}:
-        raise ValueError('space 只需 composition_ranges_wt_pct 和 protocol')
     space['composition_ranges_wt_pct'] = validate_ranges(scene, space['composition_ranges_wt_pct'])
     space['protocol'] = effective_protocol(scene, space.get('protocol', {}))
     question = args.question if args.question is not None else args.question_file.read_text()
@@ -60,7 +55,7 @@ def configuration(args):
 def write_report(output, config, result):
     """报告只引用真实产物；自由文本科研解释保留在逐轮审查意见里。"""
     report_dir = output.parent / 'reports' / config['version']
-    batch_link = f'../../{config["version"]}'
+    batch_link = f'../../{quote(config["version"], safe="")}'
     delta = result['delta']
     nodes = {node['id']: node for node in delta['nodes']}
     evidence = {record['id']: record for record in delta['evidence']}
@@ -121,7 +116,7 @@ def main(argv=None):
     (output / 'prompts.md').write_text(Path(__file__).with_name('prompts.md').read_text())
     if args.prepare_only:
         engine.save(output / 'status.json', {'status': 'prepared', 'version': args.version})
-        print(f'输入已装配：{output}\n该版本已保留；真实运行请使用下一个版本号。')
+        print(f'输入已装配：{output}\n该批次名已保留；真实运行请使用一个新名称。')
         return 0
     engine.save(output / 'status.json', {'status': 'running', 'version': args.version})
     try:

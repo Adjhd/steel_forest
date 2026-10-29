@@ -1,12 +1,12 @@
 # Campaign 产出
 
-中间结果按 `vYYYYMMDD.NNN/` 分批；最终报告和交付表格集中到 `reports/<version>/`。两处使用同一版本号，不覆盖、不混写。自然语言问题、有效场景、工具版本、范围和预算保存在批次的 `input.json`；实际使用的提示词也一并保存。
+中间结果按自定的 `<version>/` 分批；最终报告和交付表格集中到 `reports/<version>/`。两处使用同一版本号，不覆盖、不混写。自然语言问题、有效场景、工具版本、范围和预算保存在批次的 `input.json`；实际使用的提示词也一并保存。
 
 典型内容：
 
 ```text
 outputs/
-  v20261029.002/
+  trial-1/
     input.json、question.md、prompts.md
     status.json、usage.json
     round_01/
@@ -17,7 +17,7 @@ outputs/
     round_02/ ...
     forest_delta.json、forest_review.json、result.json
   reports/
-    v20261029.002/
+    trial-1/
       候选报告.md
 ```
 

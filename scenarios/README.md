@@ -14,8 +14,8 @@
 
 ## 元素与条件
 
-- **耐蚀钢**：Fe、C、Si、Mn、P、S、Cr、Ni、Cu、Mo、Nb、V、Ti、Sb、Sn、Al，Fe 余量。本次非 Fe 元素范围须全部声明，禁用元素写 `[0, 0]`。固定 45 °C 溶液、34 °C 环境、63%RH、0.5% NaCl、168 h、60×40×6 mm 试样。μm 厚度输出和相对 Q345B 质量损失比是两个量。
-- **无磁钢**：上述元素加 Zn、Mg、Re、N，Fe 余量。参考任务窗保存在 `nonmagnetic/scene.json` 的 `reference_ranges_wt_pct`，供阅读；每次启动必须显式选择范围。已知力学条件写入 `protocol.mechanical_conditions`，例如 `test_temperature_C`、`solution_temperature_C`、`solution_time_h`、`cold_reduction_pct`、`plate_thickness_mm`。未知项不补造成已知条件。
+- **耐蚀钢**：Fe、C、Si、Mn、P、S、Cr、Ni、Cu、Mo、Nb、V、Ti、Sb、Sn、Al，Fe 余量。本次范围只需列出参与研究的元素，未列非 Fe 元素按 `[0, 0]` 处理。固定 45 °C 溶液、34 °C 环境、63%RH、0.5% NaCl、168 h、60×40×6 mm 试样。μm 厚度输出和相对 Q345B 质量损失比是两个量。
+- **无磁钢**：上述元素加 Zn、Mg、Re、N，Fe 余量。范围同样只列参与研究的元素，未列非 Fe 元素为零。参考任务窗保存在 `nonmagnetic/scene.json` 的 `reference_ranges_wt_pct`，供阅读；每次启动必须显式选择范围。已知力学条件写入 `protocol.mechanical_conditions`，例如 `test_temperature_C`、`solution_temperature_C`、`solution_time_h`、`cold_reduction_pct`、`plate_thickness_mm`。未知项不补造成已知条件。
 - **高熵合金**：`hea/scene.json` 的 `elements` 是四工具共同支持的元素集合，本次研究另行指定子集和范围。成分明确为 wt.% 且合计 100，没有默认 Fe 余量。必须给出工艺文本和 0–700 °C 的测试温度；各温度分别评价。模型报告 EL 与合同断后 A 的定义不等同。
 
 ## 当前工具
@@ -45,6 +45,6 @@ result = evaluate(scene, composition, request["protocol"], candidate_output_dir)
 # result: metrics 字典、tools 列表、limitations 列表
 ```
 
-每个候选的目录保存原始物性输出及 `prediction.json`；保留缺值和适用性限制。`evaluate` 要求完整成分；钢铁允许仅省略 Fe，由声明的余量规则闭合。`effective_protocol` 允许补充未知条件，但不覆盖场景固定比较条件。
+每个候选的目录保存原始物性输出及 `prediction.json`；保留缺值和适用性限制。成分字典中省略的非余量元素表示含量为零，钢铁的 Fe 可省略并自动补足至 100 wt.%。调用钢铁模型前会补齐全部零坐标；本次范围要求含量大于零的元素仍必须给出。HEA 仅使用显式选择的元素，所给含量须合计 100 wt.%，没有自动补足的基体元素。`effective_protocol` 允许补充未知条件，但不覆盖场景固定比较条件。
 
 更换场景或模型时更新这份活动注册和对应实际调用；退役内容进入回收站，活动定义只描述当前口径。任何默认读取、运行或错误回退均不访问回收站。

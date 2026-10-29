@@ -45,15 +45,16 @@ def _post(url: str, key: str, payload: dict, *, timeout: float, proxy: str = "")
 
 
 def ask(system: str, payload: dict) -> dict:
-    """向当前配置的模型发送一次请求，返回 JSON 对象。"""
+    """发送一次请求并返回 JSON；字符上限仅在用户显式配置时启用。"""
     base = _required("LITELLM_API_BASE").rstrip("/")
     key = _required("LITELLM_API_KEY")
     model = _required("STEEL_FOREST_LLM_MODEL")
     endpoint = os.getenv("STEEL_FOREST_LLM_ENDPOINT", "/chat/completions")
     url = base if base.endswith("/chat/completions") else base + "/" + endpoint.lstrip("/")
     user_text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-    if len(system) + len(user_text) > int(os.getenv("STEEL_FOREST_MAX_REQUEST_CHARS", "128000")):
-        raise ServiceError("LLM 输入超出 STEEL_FOREST_MAX_REQUEST_CHARS，请缩小当前研究上下文")
+    request_limit = os.getenv("STEEL_FOREST_MAX_REQUEST_CHARS", "").strip()
+    if request_limit and len(system) + len(user_text) > int(request_limit):
+        raise ServiceError("LLM 输入超出你设置的 STEEL_FOREST_MAX_REQUEST_CHARS；请调整或取消该上限")
     body = {
         "model": model, "temperature": 0,
         "messages": [
@@ -75,6 +76,11 @@ def ask(system: str, payload: dict) -> dict:
         content = choice["message"]["content"]
         if isinstance(content, list):
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        if isinstance(content, str):
+            content = content.strip()
+            lines = content.splitlines()
+            if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+                content = "\n".join(lines[1:-1])
         result = json.loads(content)
     except (KeyError, IndexError, TypeError, ValueError):
         raise ServiceError("LLM 未返回有效 JSON 对象；本阶段未完成") from None
@@ -150,8 +156,8 @@ def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> list[di
     """检索真实文献线索；auto 使用已配置凭据的接口，可显式选择 lkm/dprag。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("文献查询不能为空")
-    if type(top_k) is not int or not 1 <= top_k <= 50:
-        raise ValueError("top_k 必须是 1–50 的整数")
+    if type(top_k) is not int or top_k < 1:
+        raise ValueError("top_k 必须是正整数；服务自身的数量限制由服务端处理")
     providers = {"lkm": ("BOHR_ACCESS_KEY", _lkm), "dprag": ("DPRAG_API_KEY", _dprag)}
     if provider == "auto":
         selected = [name for name, (credential, _) in providers.items() if os.getenv(credential, "").strip()]

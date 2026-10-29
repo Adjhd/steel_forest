@@ -25,7 +25,7 @@ def _number(value):
 
 
 def validate_ranges(scenario, ranges):
-    """Return a feasible wt.% box. Zero means excluded; missing means unspecified."""
+    """Return a feasible wt.% box; unlisted non-balance elements are excluded."""
     scene = load(scenario) if isinstance(scenario, str) else scenario
     if not isinstance(ranges, dict) or not ranges:
         raise ValueError("composition_ranges_wt_pct must explicitly describe this campaign")
@@ -34,9 +34,9 @@ def validate_ranges(scenario, ranges):
     if set(result) - allowed:
         raise ValueError(f"Unsupported elements: {sorted(set(result) - allowed)}")
     if balance:
-        missing = allowed - {balance} - set(result)
-        if missing:
-            raise ValueError(f"Declare each element range, using [0, 0] when excluded: {sorted(missing)}")
+        for element in scene["elements"]:
+            if element != balance:
+                result.setdefault(element, [0, 0])
         result.setdefault(balance, [0, 100])
     for element, bounds in result.items():
         if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2
@@ -48,7 +48,7 @@ def validate_ranges(scenario, ranges):
 
 
 def complete_composition(scenario, composition, ranges=None):
-    """Validate a complete recipe; only steel has an explicitly declared Fe balance."""
+    """Expand omitted zero coordinates; only steel closes the recipe with Fe."""
     scene = load(scenario) if isinstance(scenario, str) else scenario
     if not isinstance(composition, dict) or not composition:
         raise ValueError("composition must be a nonempty wt.% object")
@@ -57,9 +57,9 @@ def complete_composition(scenario, composition, ranges=None):
     if set(result) - allowed:
         raise ValueError(f"Unsupported elements: {sorted(set(result) - allowed)}")
     if balance:
-        missing = allowed - {balance} - set(result)
-        if missing:
-            raise ValueError(f"Missing composition coordinates: {sorted(missing)}")
+        for element in scene["elements"]:
+            if element != balance:
+                result.setdefault(element, 0)
     if any(not _number(v) or not 0 <= v <= 100 for v in result.values()):
         raise ValueError("Every composition value must be finite and within 0–100 wt.%")
     if balance and balance not in result:

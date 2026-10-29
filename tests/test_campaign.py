@@ -10,13 +10,14 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import quote, unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from campaign import engine, services, run as entry
 from forest import store
-from scenarios import load, validate_ranges
+from scenarios import complete_composition, load, validate_ranges
 
 
 def fixture_config():
@@ -51,7 +52,7 @@ class ResearchServices:
                 "falsifiers": "The proposed change is absent under matched conditions.",
                 "unresolved": "Unmatched process or inadequate detection limits.",
                 "verification_plan": {"measurements": ["phase", "magnetic response"]},
-                "evidence_ids": [payload["sources"][0]["id"]], "source_hypothesis_ids": [],
+                "evidence_ids": [source["id"] for source in payload["sources"][:1]], "source_hypothesis_ids": [],
             }]}
         if "proposal" in payload:
             self.stages.append("admission")
@@ -147,6 +148,45 @@ class CampaignTests(unittest.TestCase):
         bounds = {element: [value, value] for element, value in recipe.items()}
         self.assertEqual(validate_ranges(scene, bounds), bounds)
 
+    def test_sparse_steel_inputs_fill_only_zero_elements_and_fe_balance(self):
+        scene = load('nonmagnetic')
+        bounds = validate_ranges(scene, {'Mn': [4, 6]})
+        recipe = complete_composition(scene, {'Mn': 5}, bounds)
+        self.assertEqual(recipe['Fe'], 95)
+        self.assertEqual(recipe['C'], 0)
+        self.assertEqual(set(recipe), set(scene['elements']))
+        self.assertEqual(sum(recipe.values()), 100)
+        with self.assertRaisesRegex(ValueError, 'Mn=.*outside'):
+            complete_composition(scene, {'Fe': 100}, bounds)
+        with self.assertRaisesRegex(ValueError, 'Unsupported elements'):
+            validate_ranges(scene, {'not_an_element': [0, 1]})
+
+    def test_hea_hypothesis_may_exclude_a_zero_lower_bound_element(self):
+        config = fixture_config()
+        config['scenario'] = load('hea')
+        config['space']['composition_ranges_wt_pct'] = {
+            'Fe': [20, 40], 'Co': [20, 40], 'Ni': [20, 40], 'Cr': [0, 10]}
+        answer = ResearchServices(config).ask('', {'sources': []})
+        answer['hypotheses'][0]['scope']['composition_ranges_wt_pct'] = {
+            'Fe': [20, 40], 'Co': [20, 40], 'Ni': [20, 40]}
+        proposal = engine.make_hypotheses(answer, [], {'hypotheses': [], 'evidence': []}, config, 'HEA')
+        recipe = complete_composition(config['scenario'], {'Fe': 30, 'Co': 30, 'Ni': 40},
+                                      proposal['nodes'][0]['scope']['composition_ranges_wt_pct'])
+        self.assertEqual(sum(recipe.values()), 100)
+        self.assertEqual(recipe.get('Cr', 0), 0)
+        design = ResearchServices(config).ask('', {'hypotheses': proposal['nodes']})['designs'][0]
+        design.update(composition={**recipe, 'Cr': 0}, search_ranges_wt_pct={'Fe': [20, 40]})
+        design['plan']['vary_elements'] = ['Fe']
+        self.assertEqual(len(engine.expand_designs([design], proposal['nodes'], config, 1)), 1)
+
+    def test_context_retains_every_reference_of_a_selected_hypothesis(self):
+        state = {'revision': 1, 'nodes': {'H1': {
+            'id': 'H1', 'kind': 'hypothesis', 'scenario': 'scene', 'evidence_ids': ['L1', 'L2', 'L3']}},
+            'links': [], 'evidence': {key: {'id': key} for key in ('L1', 'L2', 'L3', 'UNRELATED')}}
+        context = store.context('scene', limit=1, state=state)
+        self.assertEqual(len(context['hypotheses']), 1)
+        self.assertEqual({row['id'] for row in context['evidence']}, {'L1', 'L2', 'L3'})
+
     def run_research(self, config=None, *, stub_type=ResearchServices, initial_state=None, **options):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -165,6 +205,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_complete_reviewed_campaign_merges_research_without_promoting_evidence(self):
         config = fixture_config()
+        config['version'] = '无磁钢 初筛 #1 50%'
         config["merge"] = True
         result, stub, root, canonical = self.run_research(config)
         self.assertEqual(stub.stages, ["search", "hypotheses", "admission", "design", "review"])
@@ -181,9 +222,9 @@ class CampaignTests(unittest.TestCase):
         self.assertFalse((root / '候选报告.md').exists())
         self.assertIn("frozen_pending_measurement", report.read_text())
         for name in ('input.json', 'result.json'):
-            link = f'../../{config["version"]}/{name}'
+            link = f'../../{quote(config["version"], safe="")}/{name}'
             self.assertIn(f']({link})', report.read_text())
-            self.assertTrue((report.parent / link).is_file())
+            self.assertTrue((report.parent / unquote(link)).is_file())
         original = report.read_bytes()
         with self.assertRaises(FileExistsError):
             entry.write_report(root, config, result)
@@ -202,6 +243,112 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["status"], "budget_exhausted")
         self.assertEqual(len(result["nominations"]), 1)
         self.assertEqual(result["recommended_candidate_ids"], [])
+
+    def test_partial_llm_budgets_preserve_completed_stages_without_overspending(self):
+        stages = ['search', 'hypotheses', 'admission', 'design']
+        for budget in (0, 1, 3, 4):
+            with self.subTest(llm_calls=budget):
+                config = fixture_config()
+                config['llm_calls'] = budget
+                result, stub, root, _ = self.run_research(config)
+                self.assertEqual(stub.stages, stages[:budget])
+                self.assertEqual(result['usage']['llm_calls'], budget)
+                self.assertEqual(result['status'], 'budget_exhausted')
+                self.assertEqual(result['recommended_candidate_ids'], [])
+                self.assertTrue((root / 'result.json').is_file())
+                for stage in stages[:budget]:
+                    self.assertTrue((root / 'round_01' / f'{stage}.json').is_file())
+                self.assertEqual(len(result['delta']['nodes']), int(budget >= 3))
+                self.assertEqual(stub.evaluations, int(budget == 4))
+                if budget == 4:
+                    evaluated = json.loads((root / 'round_01/evaluated.json').read_text())
+                    self.assertEqual(len(evaluated['evidence']), 1)
+                    self.assertEqual(result['delta']['nodes'][0]['kind'], 'hypothesis')
+
+    def test_zero_literature_and_evaluation_budgets_skip_the_optional_work(self):
+        class NoLiterature(ResearchServices):
+            @staticmethod
+            def literature(query):
+                raise AssertionError('A zero literature budget must not call a service')
+
+        for evaluations in (0, 1):
+            with self.subTest(evaluations=evaluations):
+                config = fixture_config()
+                config.update(literature_queries=0, evaluations=evaluations, llm_calls=2 + 2 * evaluations)
+                result, stub, root, _ = self.run_research(config, stub_type=NoLiterature)
+                self.assertEqual(stub.stages, ['hypotheses', 'admission'] + ['design', 'review'] * evaluations)
+                self.assertEqual(result['usage']['literature_queries'], 0)
+                self.assertEqual(stub.evaluations, evaluations)
+                self.assertEqual(json.loads((root / 'round_01/literature.json').read_text()), [])
+                self.assertEqual(result['status'], 'frozen_pending_measurement' if evaluations else 'budget_exhausted')
+                self.assertTrue(any(node['kind'] == 'hypothesis' for node in result['delta']['nodes']))
+                if not evaluations:
+                    self.assertEqual(result['rounds'][0]['status'], 'hypotheses_only')
+
+    def test_three_rounds_can_deliver_more_candidates_than_one_round_evaluates(self):
+        class AccumulatingResearch(ResearchServices):
+            def ask(self, system, payload):
+                answer = super().ask(system, payload)
+                if self.stages[-1] == 'design':
+                    mn = 3 + self.stages.count('design')
+                    answer['designs'][0]['composition'] = {'Mn': mn}
+                if 'evaluated' in payload:
+                    answer['recommended_candidate_ids'] = [node['id']
+                        for delta in (payload['campaign_pool'], payload['evaluated'])
+                        for node in delta['nodes'] if node['kind'] == 'candidate']
+                return answer
+
+        config = fixture_config()
+        config.update(rounds=3, llm_calls=15, recommendations=3)
+        result, stub, root, _ = self.run_research(config, stub_type=AccumulatingResearch)
+        self.assertEqual(result['status'], 'frozen_pending_measurement')
+        self.assertEqual(stub.evaluations, 3)
+        self.assertEqual(result['recommended_candidate_ids'],
+                         [f'{config["version"]}-R{index:02}-C001' for index in (1, 2, 3)])
+        self.assertEqual({node['composition']['Mn'] for node in result['delta']['nodes']
+                          if node['kind'] == 'candidate'}, {4, 5, 6})
+        review = json.loads((root / 'round_03/review_input.json').read_text())
+        self.assertEqual(sum(node['kind'] == 'candidate' for node in review['campaign_pool']['nodes']), 2)
+
+    def test_partial_endpoint_plans_are_research_but_not_final_delivery(self):
+        class FocusedResearch(ResearchServices):
+            def ask(self, system, payload):
+                answer = super().ask(system, payload)
+                if self.stages[-1] == 'design':
+                    design = answer['designs'][0]
+                    design['role'] = 'control'
+                    design['plan']['measurements'] = ['phase']
+                    answer['designs'].append({**design, 'composition': {'Mn': 6}})
+                return answer
+
+        result, stub, root, _ = self.run_research(stub_type=FocusedResearch)
+        self.assertEqual(stub.evaluations, 1)
+        self.assertEqual(len(json.loads((root / 'round_01/design.json').read_text())['designs']), 2)
+        plans = [node for node in result['delta']['nodes'] if node['kind'] == 'experiment_plan']
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['measurements'], ['phase'])
+        self.assertEqual(result['status'], 'budget_exhausted')
+        self.assertEqual(result['recommended_candidate_ids'], [])
+        self.assertTrue(any('目标端点' in reason for reason in result['delivery']['reasons']))
+
+    def test_explicit_zero_does_not_make_a_second_hea_recipe(self):
+        class SameRecipe(ResearchServices):
+            def ask(self, system, payload):
+                answer = super().ask(system, payload)
+                if self.stages[-1] == 'design':
+                    design = answer['designs'][0]
+                    design['composition'] = {'Fe': 30, 'Co': 30, 'Ni': 40}
+                    answer['designs'].append({**design, 'composition': {**design['composition'], 'Cr': 0}})
+                return answer
+
+        config = fixture_config()
+        config.update(scenario=load('hea'), evaluations=2, recommendations=2)
+        config['space'] = {'composition_ranges_wt_pct': {'Fe': [20, 40], 'Co': [20, 40], 'Ni': [20, 40]},
+                           'protocol': {'process_text': 'Unknown', 'testing': {'test_temperature_C': 700}}}
+        result, stub, _, _ = self.run_research(config, stub_type=SameRecipe)
+        self.assertEqual(stub.evaluations, 2)
+        self.assertEqual(result['recommended_candidate_ids'], [])
+        self.assertTrue(any('当前 1 个' in reason for reason in result['delivery']['reasons']))
 
     def test_review_cannot_recommend_a_candidate_without_its_accepted_plan(self):
         with self.assertRaisesRegex(ValueError, "plan_id"):
@@ -318,24 +465,41 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             space = root / "space.json"
-            space.write_text(json.dumps(fixture_config()["space"]))
-            argv = ["--version", "v20261029.001", "--question", "研究弱磁材料", "--space", str(space),
-                    "--prepare-only", "--evaluations", "1", "--recommendations", "1"]
+            space.write_text(json.dumps({**fixture_config()["space"], 'notes': '由研究者选择的元素范围'}))
+            version = '初筛 #1 50%'
+            argv = ["--version", version, "--question", "研究弱磁材料", "--space", str(space),
+                    "--scenario", 'weak_field_nonmagnetic_plate', "--prepare-only", "--evaluations", "0",
+                    "--recommendations", "3", "--literature-queries", "0", "--llm-calls", "0"]
             with patch.object(entry, "ROOT", root), patch.object(engine, "run") as execute, \
                     patch.object(store, "load") as read_forest, patch.object(services, "_post") as external:
                 self.assertEqual(entry.main(argv), 0)
-                original = (root / "outputs/v20261029.001/input.json").read_bytes()
+                batch = root / 'outputs' / version
+                original = (batch / 'input.json').read_bytes()
+                config = json.loads(original)
+                self.assertEqual(config['version'], version)
+                self.assertEqual(config['space']['notes'], '由研究者选择的元素范围')
+                self.assertEqual(config['recommendations'], 3)
+                self.assertEqual(config['evaluations'], 0)
+                self.assertEqual(config['literature_queries'], 0)
+                self.assertEqual(config['llm_calls'], 0)
                 with self.assertRaises(FileExistsError):
                     entry.main(argv)
-                self.assertEqual((root / "outputs/v20261029.001/input.json").read_bytes(), original)
-                (root / 'outputs/reports/v20261029.002').mkdir(parents=True)
-                report_only = [value if value != 'v20261029.001' else 'v20261029.002' for value in argv]
+                self.assertEqual((batch / 'input.json').read_bytes(), original)
+                (root / 'outputs/reports/report-only').mkdir(parents=True)
+                report_only = [value if value != version else 'report-only' for value in argv]
                 with self.assertRaises(FileExistsError):
                     entry.main(report_only)
-                self.assertFalse((root / 'outputs/v20261029.002').exists())
+                self.assertFalse((root / 'outputs/report-only').exists())
             execute.assert_not_called()
             read_forest.assert_not_called()
             external.assert_not_called()
+
+    def test_version_is_a_directory_name_and_cannot_escape_outputs(self):
+        for version in ('', '   ', '.', '..', '/tmp/outside', 'nested/name', 'bad\0name'):
+            with self.subTest(version=version):
+                args = entry.arguments(['--version', version, '--question', '研究问题'])
+                with self.assertRaisesRegex(ValueError, 'version'):
+                    entry.configuration(args)
 
     def test_bash_launcher_accepts_a_natural_language_question(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -370,8 +534,10 @@ class ServiceTests(unittest.TestCase):
         ]
         with patch.dict(os.environ, {"BOHR_ACCESS_KEY": "test", "DPRAG_API_KEY": "test"}, clear=True):
             with patch.object(services, "_post", side_effect=responses) as post:
-                rows = services.literature("Does the mechanism apply to this process?")
+                rows = services.literature("Does the mechanism apply to this process?", top_k=64)
         self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].args[2]['limit'], 64)
+        self.assertEqual(post.call_args_list[1].args[2]['top_k'], 64)
         self.assertEqual([row["text"] for row in rows],
                          ["A provider's interpretation", "A retrieved passage"])
         self.assertEqual([row["status"] for row in rows], ["provider_lead_only", "excerpt_unverified"])
@@ -389,6 +555,34 @@ class ServiceTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), patch.object(services, "_post", return_value=response):
             with self.assertRaisesRegex(services.ServiceError, "截断"):
                 services.ask("Return a research decision", {})
+
+    def test_large_requests_only_obey_an_explicit_user_limit(self):
+        env = {'LITELLM_API_BASE': 'https://local.example/v1', 'LITELLM_API_KEY': 'test',
+               'STEEL_FOREST_LLM_MODEL': 'test'}
+        response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"accepted": true}'}}]}
+        payload = {'context': 'x' * 130000}
+        with patch.dict(os.environ, env, clear=True), patch.object(services, '_post', return_value=response) as post:
+            self.assertEqual(services.ask('Decide', payload), {'accepted': True})
+            os.environ['STEEL_FOREST_MAX_REQUEST_CHARS'] = ''
+            self.assertEqual(services.ask('Decide', payload), {'accepted': True})
+            os.environ['STEEL_FOREST_MAX_REQUEST_CHARS'] = '100'
+            with self.assertRaisesRegex(services.ServiceError, 'STEEL_FOREST_MAX_REQUEST_CHARS'):
+                services.ask('Decide', payload)
+            self.assertEqual(post.call_count, 2)
+
+    def test_json_fences_are_accepted_without_accepting_extra_prose(self):
+        env = {'LITELLM_API_BASE': 'https://local.example/v1', 'LITELLM_API_KEY': 'test',
+               'STEEL_FOREST_LLM_MODEL': 'test'}
+        for content in ('```json\n{"accepted": true}\n```', '```\n{"accepted": true}\n```'):
+            response = {'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}
+            with self.subTest(content=content), patch.dict(os.environ, env, clear=True), \
+                    patch.object(services, '_post', return_value=response):
+                self.assertEqual(services.ask('Decide', {}), {'accepted': True})
+        response = {'choices': [{'finish_reason': 'stop', 'message': {
+            'content': 'Here is my decision:\n```json\n{"accepted": true}\n```'}}]}
+        with patch.dict(os.environ, env, clear=True), patch.object(services, '_post', return_value=response):
+            with self.assertRaisesRegex(services.ServiceError, 'JSON'):
+                services.ask('Decide', {})
 
 
 if __name__ == "__main__":

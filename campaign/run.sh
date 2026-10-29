@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# 改这里的参数，或在命令末尾传同名参数覆盖。每次运行递增版本号。
-VERSION="v20261029.001"
+# 改这里的参数，或在命令末尾传同名参数覆盖。每次运行使用一个未占用的名称。
+VERSION="trial-1"
 SCENARIO="nonmagnetic"
 PYTHON="${STEEL_HF_PYTHON:-/mnt/vepfs/Djinhan/conda_env/steel/bin/python}"
 
