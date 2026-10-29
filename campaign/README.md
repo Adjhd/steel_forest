@@ -18,7 +18,9 @@
 | `--prepare-only` | 只装配并保存输入，完全离线 |
 | `--keep-private` | 研究完成后不合入正式森林 |
 
-代码阅读顺序：`run.py` 读取输入与写报告 → `engine.py` 五个研究步骤 → `services.py` 请求外部服务。固定提示词完整放在 `prompts.md`；每轮实际请求和回答保存在输出中。`forest/store.py` 处理接受记录的最终合并。
+代码阅读顺序：`run.py` 读取输入与写报告 → `engine.py` 的 `run()` 查看研究顺序 → 各阶段函数查看具体输入输出 → `services.py` 请求外部服务。固定提示词完整放在 `prompts.md`；每轮实际请求和回答保存在输出中。`forest/store.py` 处理接受记录的最终合并。
+
+阶段函数都在 `engine.py`：`plan_searches` 规划检索 → `retrieve_literature` 获取文献 → `propose_hypotheses` 提出假设 → `review_hypotheses` 准入审查 → `design_candidates` 设计与采样 → `evaluate_designs` 真实模型预测 → `review_candidates` 研究复审。`research_context` 整理共同场景资料；`run()` 管理轮次、预算、反馈和森林更新。调试时直接在所需阶段函数内打断点。
 
 `--recommendations` 是候选数量的唯一口径，程序将它作为 `requested_candidates` 传给各阶段并写入报告。默认问题不固定数量；即使自写问题里保留了其他数量，仍以这个参数为准。它是交付目标，`--evaluations` 等参数是调用上限；预算不足时保存已有成果，不保证凑齐候选。
 

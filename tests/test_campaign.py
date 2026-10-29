@@ -443,6 +443,30 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["status"], "budget_exhausted")
         self.assertFalse(canonical.exists())
 
+    def test_rejected_round_passes_feedback_to_a_successful_next_round(self):
+        class RevisedResearch(ResearchServices):
+            def ask(self, system, payload):
+                answer = super().ask(system, payload)
+                if 'proposal' in payload and self.stages.count('admission') == 1:
+                    return self.review(payload['proposal'], accepted=False)
+                return answer
+
+        config = fixture_config()
+        config.update(rounds=2, llm_calls=8)
+        result, stub, root, _ = self.run_research(config, stub_type=RevisedResearch)
+        self.assertEqual(stub.stages, ['search', 'hypotheses', 'admission'] +
+                         ['search', 'hypotheses', 'admission', 'design', 'review'])
+        self.assertEqual(result['rounds'][0]['status'], 'hypotheses_rejected')
+        self.assertEqual(result['status'], 'frozen_pending_measurement')
+        self.assertEqual(result['usage'], {'llm_calls': 8, 'model_evaluations': 1, 'literature_queries': 2})
+        self.assertEqual(result['recommended_candidate_ids'], [f'{config["version"]}-R02-C001'])
+        for stage in ('search', 'hypotheses', 'admission', 'design', 'review'):
+            payload = json.loads((root / 'round_02' / f'{stage}_input.json').read_text())
+            self.assertEqual(payload['feedback'], {'reason': 'Revise the hypothesis.', 'next_question': '修正假设与证据'})
+        search = json.loads((root / 'round_02/search_input.json').read_text())
+        self.assertEqual(search['forest']['hypotheses'], [])
+        self.assertTrue(all('-R02-' in row['id'] for name in ('nodes', 'evidence') for row in result['delta'][name]))
+
     def test_budget_stop_is_not_a_final_recommendation(self):
         result, _, _, _ = self.run_research(finish=False)
         self.assertEqual(result["status"], "budget_exhausted")
@@ -451,7 +475,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_partial_llm_budgets_preserve_completed_stages_without_overspending(self):
         stages = ['search', 'hypotheses', 'admission', 'design']
-        for budget in (0, 1, 3, 4):
+        for budget in range(5):
             with self.subTest(llm_calls=budget):
                 config = fixture_config()
                 config['llm_calls'] = budget
@@ -465,6 +489,9 @@ class CampaignTests(unittest.TestCase):
                     self.assertTrue((root / 'round_01' / f'{stage}.json').is_file())
                 self.assertEqual(len(result['delta']['nodes']), int(budget >= 3))
                 self.assertEqual(stub.evaluations, int(budget == 4))
+                if budget:
+                    self.assertEqual(result['rounds'][-1]['next_stage'],
+                                     ['search', 'hypotheses', 'admission', 'design', 'review'][budget])
                 if budget == 4:
                     evaluated = json.loads((root / 'round_01/evaluated.json').read_text())
                     self.assertEqual(len(evaluated['evidence']), 1)
