@@ -1,6 +1,7 @@
 """Campaign checks use service substitutes; they never contact providers or models."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -202,6 +203,210 @@ class CampaignTests(unittest.TestCase):
                 literature=services_stub.literature, evaluate=services_stub.evaluate,
                 initial_state=store.load(canonical) if initial_state is None else initial_state)
         return result, services_stub, root, canonical
+
+    def test_stage_readings_keep_cited_science_and_leave_original_records_intact(self):
+        class ReferencedResearch(ResearchServices):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.requests = []
+                self.searches = 0
+
+            def literature(self, query):
+                self.searches += 1
+                return [{'source_id': f'paper-{self.searches}-{i}', 'title': f'Paper {i}',
+                         'text': f'Passage from round {self.searches}, paper {i}.',
+                         'url': f'https://example.test/{self.searches}/{i}',
+                         'provider': 'fixture', 'status': 'excerpt_unverified',
+                         'authoritative_original': False,
+                         'raw': {'text': f'Passage from round {self.searches}, paper {i}.',
+                                 'provider_trace': 'Retain this in the saved original.'}}
+                        for i in (1, 2)]
+
+            def ask(self, system, payload):
+                self.requests.append((system, copy.deepcopy(payload)))
+                answer = super().ask(system, payload)
+                if 'sources' in payload:
+                    hypothesis = answer['hypotheses'][0]
+                    hypothesis['evidence_ids'].append('L0')
+                    hypothesis['source_hypothesis_ids'] = ['H0']
+                    if self.searches == 2:
+                        hypothesis['evidence_ids'].append(f'{self.config["version"]}-R01-L01')
+                if 'evaluated' in payload:
+                    answer['finish'] = self.searches == 2
+                return answer
+
+            def evaluate(self, *args):
+                return {**super().evaluate(*args), 'raw': {'full_model_log': 'Saved model record.'}}
+
+        config = fixture_config()
+        config.update(rounds=2, llm_calls=10)
+        config['scenario']['tools'][0]['asset'] = 'asset-path-not-a-scientific-input'
+        state = {'revision': 3, 'nodes': {'H0': {
+            'id': 'H0', 'kind': 'hypothesis', 'scenario': config['scenario']['id'],
+            'statement': 'An existing hypothesis.', 'scope': copy.deepcopy(config['space']),
+            'predictions': 'Matched measurements should differ.', 'falsifiers': 'No difference.',
+            'evidence_ids': ['L0'], 'verification_plan': {'details': 'An entire earlier experiment plan.'}}},
+            'links': [], 'campaigns': [], 'evidence': {'L0': {
+                'id': 'L0', 'kind': 'literature', 'source': 'https://example.test/original',
+                'summary': 'The existing cited passage.', 'status': 'unverified',
+                'record': {'text': 'The existing cited passage.', 'url': 'https://example.test/original',
+                           'authoritative_original': False, 'raw': {'text': 'The existing cited passage.'}}}}}
+        state['nodes']['H0']['evidence_ids'].append('L-SOURCE')
+        state['evidence']['L-SOURCE'] = {'id': 'L-SOURCE', 'kind': 'literature',
+            'source': 'https://example.test/source', 'summary': 'Evidence for the inspiring source hypothesis.',
+            'status': 'unverified'}
+        original_config, original_state = copy.deepcopy(config), copy.deepcopy(state)
+        result, stub, root, _ = self.run_research(config, stub_type=ReferencedResearch, initial_state=state)
+        self.assertEqual(result['status'], 'frozen_pending_measurement')
+        self.assertEqual(config, original_config)
+        self.assertEqual(state, original_state)
+        for round_index in (1, 2):
+            folder = root / f'round_{round_index:02}'
+            payloads = {stage: json.loads((folder / f'{stage}_input.json').read_text())
+                        for stage in ('search', 'hypotheses', 'admission', 'design', 'review')}
+            search = payloads['search']
+            self.assertNotIn('sources', search)
+            self.assertNotIn('evidence', search['forest'])
+            self.assertNotIn('asset-path-not-a-scientific-input', json.dumps(payloads))
+            self.assertNotIn('An entire earlier experiment plan.', json.dumps(search))
+            self.assertEqual(search['query_limit'], 1)
+            sources = payloads['hypotheses']['sources']
+            self.assertEqual(len(sources), 2)
+            for source in sources:
+                self.assertNotIn('raw', source)
+                self.assertEqual(json.dumps(sources).count(source['text']), 1)
+                self.assertEqual(source['status'], 'excerpt_unverified')
+                self.assertIs(source['authoritative_original'], False)
+                self.assertTrue(source['source_id'] and source['url'] and source['id'])
+            current_id = f'{config["version"]}-R{round_index:02}-L01'
+            admission = payloads['admission']
+            self.assertEqual([row['id'] for row in admission['proposal']['evidence']], [current_id])
+            self.assertEqual([node['id'] for node in admission['forest']['hypotheses']], ['H0'])
+            self.assertIn('Evidence for the inspiring source hypothesis.',
+                          [row['text'] for row in admission['forest']['evidence']])
+            expected = {'L0', current_id}
+            if round_index == 2:
+                expected.add(f'{config["version"]}-R01-L01')
+            for stage in ('design', 'review'):
+                self.assertNotIn('forest', payloads[stage])
+                records = {record['id']: record for record in payloads[stage]['literature']}
+                self.assertEqual(set(records), expected)
+                self.assertEqual(records['L0']['text'], 'The existing cited passage.')
+                self.assertEqual(records[current_id]['text'], f'Passage from round {round_index}, paper 1.')
+                self.assertIs(records[current_id]['authoritative_original'], False)
+            self.assertIn('evaluations', payloads['design'])
+            self.assertNotIn('evaluated', payloads['design'])
+            self.assertIn('evaluated', payloads['review'])
+            original_sources = json.loads((folder / 'literature.json').read_text())
+            self.assertEqual(len(original_sources), 2)
+            self.assertIn('provider_trace', original_sources[1]['raw'])
+            original_model = json.loads((folder / 'evaluated.json').read_text())['evidence'][0]
+            self.assertEqual(original_model['raw']['full_model_log'], 'Saved model record.')
+            self.assertIn('source', original_model)
+            self.assertIn('tools', original_model)
+            self.assertNotIn('raw', payloads['review']['evaluated']['evidence'][0])
+        self.assertEqual(len(stub.requests), 10)
+
+    def test_review_preserves_all_candidates_and_individual_model_conditions(self):
+        def records(index, mn, *, different_conditions=False):
+            cid, pid, eid = (f'{kind}{index}' for kind in ('C', 'P', 'M'))
+            composition = {'Mn': mn, 'Fe': 100 - mn}
+            evidence = {'id': eid, 'kind': 'model', 'composition': dict(composition),
+                'metrics': {'permeability': {'value': 1.000123456789, 'unit': '1'}},
+                'protocol': {'temperature_C': 80 if different_conditions else 20},
+                'qualification': 'model_diagnostic', 'limitations': ['Measurement still required.'],
+                'tools': [{'id': 'model', 'version': 'v1', 'purpose': 'Predict', 'asset': 'local-weight-file'}]}
+            if different_conditions:
+                evidence.update(warnings=['Outside training temperature range.'],
+                                applicability={'temperature_supported': False})
+                evidence['tools'][0]['warning'] = 'Temperature extrapolation.'
+                evidence['composition']['Mn'] = mn + 0.000001
+            return {'nodes': [
+                {'id': cid, 'kind': 'candidate', 'composition': composition, 'role': 'target',
+                 'hypothesis_id': 'H1', 'hypothesis_version': 1, 'plan_id': pid, 'evidence_ids': [eid]},
+                {'id': pid, 'kind': 'experiment_plan', 'candidate_id': cid,
+                 'question': 'Compare under a common process.', 'controls': 'Fixed thermal history.',
+                 'measurements': ['phase', 'permeability'], 'process': 'Record manufacturing conditions.'}],
+                'evidence': [evidence], 'links': []}
+
+        previous = records(1, 4.123456789012345)
+        evaluated = records(2, 5.234567890123456)
+        engine.append_delta(evaluated, records(3, 5.876543210987654, different_conditions=True))
+        originals = copy.deepcopy((evaluated, previous))
+        reading = engine.review_reading(evaluated, previous)
+        self.assertEqual((evaluated, previous), originals)
+        self.assertEqual(len(reading['plan_details']), 1)
+        self.assertEqual(len(reading['model_context']), 2)
+        for name, original in (('evaluated', evaluated), ('campaign_pool', previous)):
+            visible = reading[name]
+            nodes = {node['id']: node for node in visible['nodes']}
+            self.assertEqual(set(nodes), {node['id'] for node in original['nodes']})
+            for node in original['nodes']:
+                if node['kind'] == 'candidate':
+                    self.assertEqual(nodes[node['id']]['composition'], node['composition'])
+                    self.assertEqual(nodes[node['id']]['evidence_ids'], node['evidence_ids'])
+                else:
+                    self.assertEqual(nodes[node['id']]['candidate_id'], node['candidate_id'])
+                    details = reading['plan_details'][nodes[node['id']]['plan_details']]
+                    self.assertEqual(details['controls'], node['controls'])
+                    self.assertEqual(details['measurements'], node['measurements'])
+            self.assertEqual({row['id'] for row in visible['evidence']},
+                             {row['id'] for row in original['evidence']})
+            for source, row in zip(original['evidence'], visible['evidence']):
+                self.assertEqual(row['metrics'], source['metrics'])
+                context = reading['model_context'][row['model_context']]
+                self.assertEqual(context['protocol'], source['protocol'])
+                self.assertNotIn('asset', context['tools'][0])
+                if source['id'] == 'M3':
+                    self.assertEqual(row['warnings'], source['warnings'])
+                    self.assertEqual(row['applicability'], source['applicability'])
+                    self.assertEqual(row['composition'], source['composition'])
+                    self.assertEqual(context['tools'][0]['warning'], source['tools'][0]['warning'])
+
+    def test_forest_reading_preserves_scopes_quotes_and_transfer_requirements(self):
+        state = {'revision': 1, 'evidence': {}, 'nodes': {
+            key: {'id': key, 'kind': 'hypothesis', 'scenario': scenario,
+                  'statement': 'A conditional mechanism.', 'predictions': 'A measurable contrast.',
+                  'scope': {'conditions': conditions}, 'evidence_ids': []}
+            for key, scenario, conditions in (('H1', 'target', 'Room temperature'),
+                                              ('H2', 'source', 'Elevated temperature'))},
+            'links': [{'source': 'H2', 'target': 'H1', 'relation': 'transfer_candidate',
+                'transfer_contract': {'source_scope': {'conditions': 'Elevated temperature'},
+                    'target_scope': {'conditions': 'Room temperature'}, 'contract_version': 1,
+                    'shared_mechanism': 'A proposed phase mechanism.',
+                    'verification': 'Measure both temperatures.',
+                    'scope_differences': [{'axis': 'temperature', 'source': 'Elevated', 'target': 'Room',
+                                           'source_hypothesis_id': 'H2', 'target_hypothesis_id': 'H1'}]}}]}
+        state['nodes']['H2']['source_refs'] = [{'quote': 'Observed under the elevated-temperature protocol.',
+            'source_span': {'path': 'papers/source.txt', 'start': 10, 'end': 60},
+            'quote_binding': {'doi': '10.example/paper', 'binding_revision': 8}}]
+        original = copy.deepcopy(state)
+        context = store.context('target', limit=2, state=state)
+        cards = {node['id']: node for node in context['hypotheses']}
+        self.assertEqual(cards['H1']['scope'], state['nodes']['H1']['scope'])
+        self.assertEqual(cards['H2']['scope'], state['nodes']['H2']['scope'])
+        reference = cards['H2']['source_refs'][0]
+        self.assertEqual(reference['quote'], state['nodes']['H2']['source_refs'][0]['quote'])
+        self.assertEqual(reference['source_location'],
+                         {'path': 'papers/source.txt', 'start': 10, 'end': 60, 'doi': '10.example/paper'})
+        contract = context['links'][0]['transfer_contract']
+        self.assertEqual(contract['verification'], 'Measure both temperatures.')
+        self.assertEqual(contract['scope_differences'],
+                         [{'axis': 'temperature', 'source': 'Elevated', 'target': 'Room'}])
+        self.assertNotIn('source_scope', contract)
+        self.assertEqual(context['evidence'], [])
+        context['hypotheses'][0]['scope']['conditions'] = 'Changed only in a detached view.'
+        self.assertEqual(state, original)
+
+    def test_every_stage_receives_the_shared_delivery_and_evidence_rules(self):
+        instructions = engine.prompts()
+        self.assertEqual(set(instructions), {'search', 'hypotheses', 'admission', 'design', 'review'})
+        for stage, system in instructions.items():
+            with self.subTest(stage=stage):
+                self.assertIn('以 requested_candidates 为准', system)
+                self.assertIn('优先于 question 中的数量描述', system)
+                self.assertIn('缺失的依据不能由ID或常识补写', system)
+                self.assertIn('预算限制调用，不保证交付', system)
 
     def test_complete_reviewed_campaign_merges_research_without_promoting_evidence(self):
         config = fixture_config()

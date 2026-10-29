@@ -16,7 +16,7 @@ reading = context("weak_field_nonmagnetic_plate", state=state)
 hypothesis = state["nodes"]["某个节点ID"]
 ```
 
-`context` 默认返回最多 12 张假设卡片，保留作用域、可证伪预测和验证计划。跨场景内容只能沿明确的 `transfer_candidate` 关系读取，并携带迁移合同；合同是待验证的研究桥梁。卡片只带关联证据，不自动提供已有配方、实验设计或模型预测。完整科学字段可按节点 ID 从当前森林读取。
+`context` 默认返回最多 12 张假设卡片，保留完整作用域、预测、证伪条件和关联证据；缺少预测的卡片另带验证计划。跨场景内容沿明确的 `transfer_candidate` 关系读取，保留共同机理、条件差异、验证方法与风险，省略重复登记字段。`source_refs` 中已有的摘录和来源定位会随卡片提供，它们仍是来源线索，不会自动变成已核验的证据或新增 `evidence_ids`。完整科学字段可按节点 ID 从当前森林读取。
 
 `load(path=None)` 返回普通字典：`nodes`、`evidence` 按 ID 索引，`links`、`campaigns` 是列表，`revision` 是森林版本号。默认路径就是本目录的 `canonical.json`。
 

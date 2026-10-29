@@ -20,8 +20,78 @@ def save(path, value):
 
 def prompts():
     text = Path(__file__).with_name('prompts.md').read_text()
-    return {part.split('\n', 1)[0].strip(): part.split('\n', 1)[1]
-            for part in text.split('\n## ')[1:]}
+    preface, *stages = text.split('\n## ')
+    rules = preface.split('\n', 1)[1].strip()
+    return {part.split('\n', 1)[0].strip(): rules + '\n\n' + part.split('\n', 1)[1]
+            for part in stages}
+
+
+def fields(record, names):
+    """从记录中选取阅读所需字段；完整记录仍原样保存。"""
+    return {key: record[key] for key in names.split() if key in record}
+
+
+def literature_reading(records):
+    """文献正文只呈现一次，保留出处、适用条件和核验状态。"""
+    result = []
+    for record in records:
+        source = record.get('record', record)
+        item = fields(source, 'source_id title url source provider query authoritative_original status')
+        if isinstance(item.get('source'), dict):
+            item['source'] = fields(item['source'], 'title uri url doi source_id authoritative_original')
+        item.update(fields(record, 'id kind status scope applicability quote'))
+        item['text'] = source.get('text') or record.get('summary') or record.get('statement', '')
+        result.append(item)
+    return result
+
+
+def hypothesis_reading(nodes):
+    return [fields(node, 'id revision scenario status statement scope predictions falsifiers unresolved '
+                         'evidence_ids source_hypothesis_ids transfer_contract source_refs') for node in nodes]
+
+
+def cited_evidence(nodes, records):
+    ids = {eid for node in nodes for eid in node.get('evidence_ids', [])}
+    return [record for record in records if record['id'] in ids]
+
+
+def review_reading(evaluated, previous):
+    """完整候选池的阅读视图；相同模型条件和计划正文只存一份。"""
+    models, plans, views = {}, {}, []
+
+    def reference(table, value):
+        for key, existing in table.items():
+            if existing == value:
+                return key
+        key = str(len(table) + 1)
+        table[key] = value
+        return key
+
+    for delta in (evaluated, previous):
+        nodes, evidence = [], []
+        recipes = {eid: node['composition'] for node in delta['nodes'] if node['kind'] == 'candidate'
+                   for eid in node['evidence_ids']}
+        for node in delta['nodes']:
+            if node['kind'] == 'candidate':
+                nodes.append(fields(node, 'id kind composition role hypothesis_id hypothesis_version plan_id evidence_ids sampled'))
+            else:
+                details = {key: value for key, value in node.items()
+                           if key not in {'id', 'kind', 'scenario', 'version', 'revision', 'version_id',
+                                          'updated_at', 'status', 'scientific_result', 'candidate_id', 'statement'}}
+                nodes.append({**fields(node, 'id kind candidate_id'), 'plan_details': reference(plans, details)})
+        for record in delta['evidence']:
+            shared = fields(record, 'protocol limitations qualification')
+            shared['tools'] = [{key: value for key, value in tool.items() if key not in {'asset', 'kind'}}
+                               for tool in record['tools']]
+            item = {key: value for key, value in record.items()
+                    if key not in {'source', 'summary', 'composition', 'protocol', 'limitations',
+                                   'qualification', 'tools', 'raw', 'record'}}
+            item['model_context'] = reference(models, shared)
+            if record.get('composition') != recipes.get(record['id']):
+                item['composition'] = record.get('composition')
+            evidence.append(item)
+        views.append({'nodes': nodes, 'evidence': evidence})
+    return {'evaluated': views[0], 'campaign_pool': views[1], 'model_context': models, 'plan_details': plans}
 
 
 def accepted(delta, review, existing_evidence=()):
@@ -250,16 +320,19 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
             folder.mkdir()
             prefix = f'{config["version"]}-R{index:02}'
             context = store.context(config['scenario']['id'], limit=4, state=state)
-            common = {'question': config['question'], 'scenario': config['scenario'], 'space': config['space'],
-                      'forest': context, 'feedback': feedback, 'evaluations': config['evaluations'],
-                      'requested_candidates': config['recommendations']}
+            task = {'question': config['question'], 'requested_candidates': config['recommendations'], 'feedback': feedback}
+            scene = fields(config['scenario'], 'name composition_unit balance limitations')
+            scene['metrics'] = [fields(metric, 'key label unit direction target op role qualification')
+                                for metric in config['scenario']['metrics']]
+            for metric, spec in zip(scene['metrics'], config['scenario']['metrics']):
+                if spec.get('ranking'):
+                    metric['ranking'] = fields(spec['ranking'], 'allowed qualification physical_threshold_qualified')
+            research = {'scenario': scene, 'space': config['space']}
 
             def call(stage, extra):
                 if usage['llm_calls'] >= config['llm_calls']:
                     raise BudgetExhausted(stage)
-                payload = {**common, **extra}
-                if stage in ('design', 'review'):
-                    payload.pop('forest')  # 本阶段只需要准入假设、当前候选与实际结果。
+                payload = {**task, **extra}
                 save(folder / f'{stage}_input.json', payload)
                 usage['llm_calls'] += 1
                 save(output / 'usage.json', usage)
@@ -268,7 +341,17 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
                 return answer
 
             sources = []
-            queries = call('search', {'query_limit': config['literature_queries']})['queries'] if config['literature_queries'] else []
+            queries = []
+            if config['literature_queries']:
+                questions = [{**fields(node, 'id statement status falsifiers'), 'scope': fields(node['scope'],
+                              'conditions composition_ranges_wt_pct material_system_id exposure_protocol process_id unknowns')}
+                             for node in context['hypotheses']]
+                bridges = [{**fields(link, 'source target relation'),
+                            'transfer_contract': fields(link.get('transfer_contract', {}),
+                                                        'shared_mechanism source_conditions target_conditions')}
+                           for link in context['links']]
+                queries = call('search', {**research, 'forest': {'hypotheses': questions, 'links': bridges},
+                                         'query_limit': config['literature_queries']})['queries']
             for query in queries[:config['literature_queries']]:
                 usage['literature_queries'] += 1
                 save(output / 'usage.json', usage)
@@ -276,8 +359,19 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
             for i, source in enumerate(sources, 1):
                 source['id'] = f'{prefix}-L{i:02}'
             save(folder / 'literature.json', sources)
-            proposal = make_hypotheses(call('hypotheses', {'sources': sources}), sources, context, config, prefix)
-            admission = call('admission', {'proposal': proposal})
+            reading = {'hypotheses': context['hypotheses'], 'links': context['links'],
+                       'evidence': literature_reading(context['evidence'])}
+            proposal = make_hypotheses(call('hypotheses', {**research, 'forest': reading,
+                                      'sources': literature_reading(sources)}), sources, context, config, prefix)
+            proposal['evidence'] = cited_evidence(proposal['nodes'], proposal['evidence'])
+            source_ids = {sid for node in proposal['nodes'] for sid in node.get('source_hypothesis_ids', [])}
+            source_hypotheses = [node for node in reading['hypotheses'] if node['id'] in source_ids]
+            admission = call('admission', {**research,
+                'proposal': {'nodes': hypothesis_reading(proposal['nodes']),
+                             'evidence': literature_reading(proposal['evidence'])},
+                'forest': {'hypotheses': source_hypotheses,
+                           'evidence': literature_reading(cited_evidence(proposal['nodes'] + source_hypotheses,
+                                                                        context['evidence']))}})
             inherited_evidence = {eid for node in proposal['nodes'] for eid in node.get('evidence_ids', [])
                                   if eid in state['evidence']}
             admitted = accepted(proposal, admission, inherited_evidence)
@@ -292,13 +386,19 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
                 feedback = {'reason': admission['reason'], 'next_question': '继续研究假设与证据'}
                 rounds.append({'round': index, 'status': 'hypotheses_only'})
                 continue
-            designs = call('design', {'hypotheses': admitted['nodes']})
+            designs = call('design', {**research, 'hypotheses': hypothesis_reading(admitted['nodes']),
+                'literature': literature_reading(cited_evidence(admitted['nodes'], state['evidence'].values())),
+                'tools': [{key: value for key, value in tool.items() if key not in {'asset', 'kind'}}
+                          for tool in config['scenario']['tools']],
+                'evaluations': config['evaluations']})
             points = expand_designs(designs['designs'], admitted['nodes'], config, index)
             evaluated = evaluate_designs(points, config, folder, prefix, evaluate, usage)
             previous_pool = candidate_pool(total)
             prior_ids = {n['hypothesis_id'] for n in previous_pool['nodes'] if n['kind'] == 'candidate'}
             review_hypotheses = [n for n in total['nodes'] if n['id'] in prior_ids or n in admitted['nodes']]
-            review = call('review', {'hypotheses': review_hypotheses, 'evaluated': evaluated, 'campaign_pool': previous_pool})
+            review = call('review', {'scenario': scene, 'hypotheses': hypothesis_reading(review_hypotheses),
+                'literature': literature_reading(cited_evidence(review_hypotheses, state['evidence'].values())),
+                **review_reading(evaluated, previous_pool)})
             approved = accepted(evaluated, review)
             state = store.apply(state, evaluated, review)
             append_delta(total, approved)

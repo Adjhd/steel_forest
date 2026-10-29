@@ -22,8 +22,36 @@ def load(path=None) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _context_link(link):
+    """Keep the scientific bridge; its endpoint cards already contain both scopes."""
+    result = {key: link[key] for key in ("source", "target", "relation")}
+    if link.get("transfer_contract"):
+        repeated = {"contract_version", "scope_binding", "source_scope", "target_scope",
+                    "source_hypothesis_id", "target_hypothesis_id",
+                    "source_hypothesis_version_id", "target_hypothesis_version_id",
+                    "accounted_axes"}
+        contract = {key: value for key, value in link["transfer_contract"].items()
+                    if key not in repeated}
+        if "scope_differences" in contract:
+            contract["scope_differences"] = [
+                {key: value for key, value in difference.items()
+                 if key in {"axis", "source", "target"}}
+                for difference in contract["scope_differences"]]
+        result["transfer_contract"] = contract
+    return result
+
+
+def _context_source(reference):
+    """Expose an existing quote and its locator, without upgrading its evidence level."""
+    fields = {"run_id", "chunk_id", "path", "span_id", "start", "end", "doi", "url", "title"}
+    location = {}
+    for record in (reference, reference.get("source_span", {}), reference.get("quote_binding", {})):
+        location.update({key: value for key, value in record.items() if key in fields})
+    return {"quote": reference["quote"], "source_location": location}
+
+
 def context(scenario, limit=12, state=None) -> dict:
-    """Return bounded hypothesis cards and explicit bridges, without candidates."""
+    """Read hypothesis conditions, linked evidence and bridges without candidates."""
     state = load() if state is None else state
     if limit < 1:
         raise ValueError("Context limit must be positive")
@@ -47,7 +75,7 @@ def context(scenario, limit=12, state=None) -> dict:
     for node in direct:
         if len(chosen) < limit:
             chosen.setdefault(node["id"], node)
-    links = [link for link in state["links"]
+    links = [_context_link(link) for link in state["links"]
              if link["source"] in chosen and link["target"] in chosen]
     evidence_ids = {key for node in chosen.values() for key in node.get("evidence_ids", [])}
     evidence = [record for key, record in state["evidence"].items() if key in evidence_ids]
@@ -56,7 +84,13 @@ def context(scenario, limit=12, state=None) -> dict:
     cards = []
     for node in chosen.values():
         card = {key: value for key, value in node.items() if key in fields}
-        card["verification_plan"] = node.get("verification_plan") or node.get("verification_action")
+        # A new campaign designs its own experiments; retain a plan only when
+        # the source card has no predictions to explain what would be tested.
+        if not node.get("predictions"):
+            card["verification_plan"] = node.get("verification_plan") or node.get("verification_action")
+        if node.get("source_refs"):
+            card["source_refs"] = [_context_source(reference) for reference in node["source_refs"]
+                                   if reference.get("quote")]
         cards.append(card)
     return {"revision": state["revision"], "scenario": scenario,
             "hypotheses": copy.deepcopy(cards), "links": copy.deepcopy(links),

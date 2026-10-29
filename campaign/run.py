@@ -25,7 +25,7 @@ def arguments(argv=None):
     parser.add_argument('--evaluations', type=int, default=12, help='每轮最多预测的成分数；0 表示只研究假设')
     parser.add_argument('--literature-queries', type=int, default=2, help='每轮文献查询数；0 跳过检索，每个已配置服务各调用一次')
     parser.add_argument('--llm-calls', type=int, default=15, help='本批语言模型请求上限，不自动重试')
-    parser.add_argument('--recommendations', type=int, default=3, help='最终至少交付的候选数')
+    parser.add_argument('--recommendations', type=int, default=3, help='本批至少交付的不同成分候选数；优先于自然语言中的数量描述')
     parser.add_argument('--prepare-only', action='store_true', help='仅装配输入，不读取森林、不调用模型与服务')
     parser.add_argument('--keep-private', action='store_true', help='保留研究结果，暂不合入canonical')
     return parser.parse_args(argv)
@@ -62,7 +62,9 @@ def write_report(output, config, result):
     selected = result['recommended_candidate_ids']
     lines = [f'# {config["scenario"]["name"]}候选报告', '',
              f'批次：`{config["version"]}`；状态：`{result["status"]}`。', '',
-             config['question'], '', f'通过交付检查的候选：**{len(selected)}**。', '',
+             config['question'], '',
+             f'本批交付目标：至少 **{config["recommendations"]}** 个不同成分候选（以 --recommendations 为准）。', '',
+             f'通过交付检查的候选：**{len(selected)}**。', '',
              '性能数值均为模型输出。待测计划不代表已取得实测结果；预算结束不代表科学收敛。', '',
              f'实际调用：LLM {result["usage"]["llm_calls"]} 次；文献查询 {result["usage"]["literature_queries"]} 次；成分评估 {result["usage"]["model_evaluations"]} 次。', '',
              f'完整输入见 [input.json]({batch_link}/input.json)，研究记录见 [result.json]({batch_link}/result.json)。', '']
