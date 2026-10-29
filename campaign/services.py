@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Iterator
 
 import requests
 
@@ -19,8 +20,8 @@ def _required(name: str) -> str:
     return value
 
 
-def _post(url: str, key: str, payload: dict, *, timeout: float, proxy: str = "") -> dict:
-    """每次调用只发送一个请求；超时后由 campaign 决定如何恢复。"""
+def _post(url: str, key: str, payload: dict, *, service: str, timeout: float, proxy: str = "") -> dict:
+    """每次只发送一个请求；错误标明服务，不包含地址、凭据或响应正文。"""
     proxies = None
     if proxy:
         proxy = proxy if "://" in proxy else "socks5h://" + proxy
@@ -31,16 +32,17 @@ def _post(url: str, key: str, payload: dict, *, timeout: float, proxy: str = "")
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         )
         response.raise_for_status()
-        body = response.json()
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
-        raise ServiceError(f"远端服务返回 HTTP {status}") from None
+        raise ServiceError(f"{service} 返回 HTTP {status}") from None
     except requests.RequestException as exc:
-        raise ServiceError(f"网络请求失败：{type(exc).__name__}") from None
+        raise ServiceError(f"{service} 网络请求失败：{type(exc).__name__}") from None
+    try:
+        body = response.json()
     except ValueError:
-        raise ServiceError("远端服务未返回有效 JSON") from None
+        raise ServiceError(f"{service} 未返回有效 JSON") from None
     if not isinstance(body, dict):
-        raise ServiceError("远端服务的 JSON 顶层必须是对象")
+        raise ServiceError(f"{service} 的 JSON 顶层必须是对象")
     return body
 
 
@@ -66,7 +68,7 @@ def ask(system: str, payload: dict) -> dict:
         body["response_format"] = {"type": "json_object"}
     if os.getenv("STEEL_FOREST_LLM_ENABLE_THINKING", "").lower() in {"0", "false", "no"}:
         body["chat_template_kwargs"] = {"enable_thinking": False}
-    response = _post(url, key, body,
+    response = _post(url, key, body, service="LLM",
         timeout=float(os.getenv("STEEL_FOREST_LLM_TIMEOUT_SEC", "180")),
         proxy=os.getenv("LITELLM_SOCKS5_PROXY", "").strip())
     try:
@@ -109,7 +111,7 @@ def _lkm(query: str, top_k: int) -> list[dict]:
     body = _post(endpoint, _required("BOHR_ACCESS_KEY"), {
         "query": query, "retrieval_mode": "hybrid", "sort_by": "comprehensive",
         "limit": top_k, "reasoning_only": False,
-    }, timeout=60)
+    }, service="LKM", timeout=60)
     if body.get("code") not in (0, None):
         raise ServiceError("LKM 接口报告调用失败")
     data = body.get("data")
@@ -136,7 +138,7 @@ def _dprag(query: str, top_k: int) -> list[dict]:
         endpoint = base + "/literature/retrieve-context"
     else:
         endpoint = base + "/api/v1/literature/retrieve-context"
-    body = _post(endpoint, _required("DPRAG_API_KEY"), {"query": query, "top_k": top_k}, timeout=180)
+    body = _post(endpoint, _required("DPRAG_API_KEY"), {"query": query, "top_k": top_k}, service="DPRAG", timeout=180)
     data = body.get("data")
     if not isinstance(data, dict) or not isinstance(data.get("context"), str):
         raise ServiceError("DPRAG 响应缺少 data.context")
@@ -152,8 +154,8 @@ def _dprag(query: str, top_k: int) -> list[dict]:
     return records
 
 
-def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> list[dict]:
-    """检索真实文献线索；auto 使用已配置凭据的接口，可显式选择 lkm/dprag。"""
+def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> Iterator[dict]:
+    """服务依次请求、结果逐条返回，调用方可在下一服务请求前保存。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("文献查询不能为空")
     if type(top_k) is not int or top_k < 1:
@@ -167,8 +169,6 @@ def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> list[di
         selected = [provider]
     else:
         raise ValueError("文献 provider 必须是 auto、lkm 或 dprag")
-    records = []
     for name in selected:
         for record in providers[name][1](query.strip(), top_k):
-            records.append({**record, "query": query.strip()})
-    return records
+            yield {**record, "query": query.strip()}

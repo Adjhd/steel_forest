@@ -374,15 +374,18 @@ def plan_searches(call, research, context, limit):
 
 
 def retrieve_literature(queries, literature, usage, folder, prefix):
-    """执行查询、记录实际调用，为原始文献结果分配本轮 ID。"""
+    """逐条分配 ID 并保存文献；后续请求失败也保留已取得的结果。"""
     sources = []
-    for query in queries:
+    save(folder / 'literature.json', sources)
+    for index, query in enumerate(queries, 1):
         usage['literature_queries'] += 1
         save(folder.parent / 'usage.json', usage)
-        sources.extend(literature(query))
-    for index, source in enumerate(sources, 1):
-        source['id'] = f'{prefix}-L{index:02}'
-    save(folder / 'literature.json', sources)
+        try:
+            for source in literature(query):
+                sources.append({**source, 'id': f'{prefix}-L{len(sources) + 1:02}'})
+                save(folder / 'literature.json', sources)
+        except services.ServiceError as error:
+            raise services.ServiceError(f'第 {index} 个文献查询失败：{error}') from None
     return sources
 
 

@@ -148,14 +148,14 @@ PYTHON
 # 检索一个问题；auto 请求所有已配置的文献服务。
 "$campaign_python" -B - <<'PYTHON'
 from campaign.services import literature
-rows = literature('austenitic nonmagnetic steel manganese nitrogen', provider='auto', top_k=2)
+rows = list(literature('austenitic nonmagnetic steel manganese nitrogen', provider='auto', top_k=2))
 print('线索数：', len(rows))
 for row in rows:
     print(row['provider'], row['title'], row['url'], row['text'][:160])
 PYTHON
 ```
 
-单测一个文献服务时将 `provider='auto'` 改成 `'lkm'` 或 `'dprag'`。返回零条线索表示请求成功但未检索到结果，可换检索词；HTTP 401/403 时检查对应凭据与权限，404 时检查地址拼接和网关路径，JSON 错误时检查模型输出及 `response_format` 支持情况。服务错误不会打印密钥或响应正文，也不会自动重试。
+单测一个文献服务时将 `provider='auto'` 改成 `'lkm'` 或 `'dprag'`。`literature()` 返回迭代器，每个服务的结果在请求下一服务前逐条交给调用方；示例用 `list()` 收集完整结果，campaign 则逐条保存。返回零条线索表示请求成功但未检索到结果，可换检索词；HTTP 401/403 时检查对应凭据与权限，404 时检查地址拼接和网关路径，JSON 错误时检查模型输出及 `response_format` 支持情况。错误标明 LLM、LKM 或 DPRAG；campaign 的文献错误还标明查询序号，例如“第 2 个文献查询失败：DPRAG 返回 HTTP 504”。不会打印密钥或响应正文，也不会自动重试。
 
 接口通过后，先离线检查，再用一轮、小预算运行真实链路。版本号是示例，每次执行都必须使用未占用的新版本：
 
@@ -174,7 +174,7 @@ bash campaign/run.sh --version debug-1 \
 
 LLM 预算逐次计算：例如 `--llm-calls 1` 可只运行第一步，已完成的阶段仍落盘；`0` 不调用 LLM。`--evaluations 0` 保留假设研究与准入，跳过设计和预测。预测先考虑明确设计，再在剩余预算内搜索；超出预算的设计保留在 `design.json` 中但不执行。达到预算正常结束为 `budget_exhausted`；已接受记录可合入森林，调试时使用 `--keep-private`。
 
-先用新版本执行 `--prepare-only` 检查范围和协议。正式运行失败时保留输入、已完成的各阶段JSON、逐候选原始输出和 `status.json`；修正输入或代码后开新版本重跑。没有隐式续跑、自动加预算或切换模型的分支。
+先用新版本执行 `--prepare-only` 检查范围和协议。正式运行失败时保留输入、已完成的各阶段JSON、逐候选原始输出和 `status.json`；文献结果逐条分配 ID 并写入 `literature.json`，后续服务或查询失败不会丢掉已取得的结果。检索开始时该文件为空列表，失败批次中的内容可能不完整，不代表文献阶段已经完成。修正输入或代码后开新版本重跑。没有隐式续跑、自动加预算或切换模型的分支。
 
 每轮选取4张当前假设卡、它们引用的全部证据以及可见的显式关系，再按阶段职责组织输入；复审可选本轮候选和本批此前全部获准候选，记录不会混入其他campaign。正式森林合并在批次结束时进行，采用启动时的森林版本；若其他批次先提交，会停止合并，保留本批delta与审查结果，待基于当前森林重新审查。
 
