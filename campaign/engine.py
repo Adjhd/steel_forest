@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
-import random
+import math
+from copy import deepcopy
 from pathlib import Path
 
 from forest import store
 from scenarios import complete_composition, validate_ranges, evaluate as evaluate_model
-from campaign import services
+from campaign import search, services
 
 
 class BudgetExhausted(Exception):
@@ -73,7 +74,7 @@ def review_reading(evaluated, previous):
                    for eid in node['evidence_ids']}
         for node in delta['nodes']:
             if node['kind'] == 'candidate':
-                nodes.append(fields(node, 'id kind composition role hypothesis_id hypothesis_version plan_id evidence_ids sampled'))
+                nodes.append(fields(node, 'id kind composition role hypothesis_id hypothesis_version plan_id evidence_ids sampled protocol_case_ids'))
             else:
                 details = {key: value for key, value in node.items()
                            if key not in {'id', 'kind', 'scenario', 'version', 'revision', 'version_id',
@@ -166,12 +167,12 @@ def validate_plan(plan):
         raise ValueError('measurements 必须是端点列表')
 
 
-def expand_designs(designs, hypotheses, config, round_index):
-    """先保留明确设计，再在假设声明的子范围内补充采样。"""
+def search_spaces(designs, hypotheses, config):
+    """把科研设计转成数值空间；身份和计划留在模板中，不交给搜索算法。"""
     scenario = config['scenario']
     ids = {n['id']: n for n in hypotheses}
-    result, regions = [], []
-    for design in designs[:config['evaluations']]:
+    spaces, templates = [], {}
+    for index, design in enumerate(designs[:config['evaluations']], 1):
         if design['hypothesis_id'] not in ids:
             raise ValueError('候选必须绑定本轮已准入假设')
         if design['role'] not in ('target', 'control', 'discrimination_probe'):
@@ -181,91 +182,127 @@ def expand_designs(designs, hypotheses, config, round_index):
             if len(set(competitors)) < 2 or not set(competitors) <= ids.keys() or not design['plan'].get('contrasting_predictions'):
                 raise ValueError('区分探针需要至少两个已准入竞争假设及不同预测')
         validate_plan(design['plan'])
-        hypothesis_ranges = ids[design['hypothesis_id']]['scope']['composition_ranges_wt_pct']
-        item = dict(design)
-        item['composition'] = complete_composition(scenario, design['composition'], hypothesis_ranges)
-        result.append(item)
+        bounds = ids[design['hypothesis_id']]['scope']['composition_ranges_wt_pct']
+        item = {**design, 'composition': complete_composition(scenario, design['composition'], bounds)}
+        region = {e: [value, value] for e, value in item['composition'].items()}
         if design.get('search_ranges_wt_pct'):
-            allowed_variation = set(design['plan'].get('vary_elements', []))
-            if not allowed_variation:
+            varied = set(design['plan'].get('vary_elements', []))
+            if not varied:
                 raise ValueError('补充搜索必须声明 plan.vary_elements')
-            region = {e: [value, value] for e, value in item['composition'].items()}
             region.update(design['search_ranges_wt_pct'])
             if scenario.get('balance'):
-                region[scenario['balance']] = hypothesis_ranges[scenario['balance']]
-            for element, bounds in region.items():
-                low, high = hypothesis_ranges.get(element, [0, 0])
-                if len(bounds) != 2 or not low <= bounds[0] <= bounds[1] <= high:
+                region[scenario['balance']] = bounds[scenario['balance']]
+            for element, interval in region.items():
+                low, high = bounds.get(element, [0, 0])
+                if len(interval) != 2 or not low <= interval[0] <= interval[1] <= high:
                     raise ValueError('候选搜索范围必须在已准入假设范围内')
-                if bounds[0] != bounds[1] and element != scenario.get('balance') and element not in allowed_variation:
+                if interval[0] != interval[1] and element != scenario.get('balance') and element not in varied:
                     raise ValueError('补充搜索只能改变计划列出的元素')
             region = validate_ranges(scenario, region)
-            regions.append((item, region))
-    rng = random.Random(round_index)
-    seen = {tuple(sorted((e, v) for e, v in d['composition'].items() if v)) for d in result}
-    for attempt in range(config['evaluations'] * 100):
-        if not regions or len(result) >= config['evaluations']:
-            break
-        template, region = regions[attempt % len(regions)]
-        point = {e: rng.uniform(*bounds) for e, bounds in region.items()}
-        if scenario['id'] != 'high_temperature_high_entropy_alloy':
-            point.pop('Fe', None)
+            # 显式种子也须属于它声明的搜索空间。
+            complete_composition(scenario, item['composition'], region)
+        sid = f'D{index:03}'
+        templates[sid] = item
+        spaces.append({'id': sid, 'bounds': region, 'seeds': [item['composition']],
+                       'balance': scenario.get('balance'), 'total': 100,
+                       'optimize': item['role'] == 'target'})
+    return spaces, templates
+
+
+def search_objectives(config):
+    """每个条件独立建模；只有登记允许排序的指标参与 BO 和 Pareto。"""
+    return [{**fields(metric, 'direction target op'), 'key': f'{name}/{metric["key"]}'}
+            for name, case in config['space']['protocol_cases'].items()
+            for metric in config['scenario']['metrics']
+            if metric['key'] in case['metrics'] and metric['role'] == 'screening'
+            and metric.get('ranking', {}).get('allowed', True)]
+
+
+def evaluate_candidate(design, composition, config, folder, prefix, index, evaluate, usage, cache):
+    """一个实际成分对应多条条件证据；完全相同的本批调用可引用已有结果。"""
+    cid, pid = (f'{prefix}-{kind}{index:03}' for kind in ('C', 'P'))
+    evidence, values = [], {}
+    cases = config['space']['protocol_cases']
+    usage['candidate_evaluations'] += 1
+    save(folder.parent / 'usage.json', usage)
+    versions = {tool['id']: tool['version'] for tool in config['scenario']['tools']}
+    for case_index, (name, case) in enumerate(cases.items(), 1):
+        eid = f'{prefix}-M{index:03}-K{case_index:02}'
+        coordinates = {element: float(value) for element, value in composition.items() if value}
+        key = json.dumps([coordinates, case['protocol'], {tid: versions[tid] for tid in case['tools']}], sort_keys=True)
+        if key in cache:
+            record = {**deepcopy(cache[key]), 'reused_from': cache[key]['id']}
         else:
-            # HEA 从区间下界逐次分配剩余总量，不指定某种元素作基体。
-            point = {e: bounds[0] for e, bounds in region.items()}
-            elements = list(point)
-            rng.shuffle(elements)
-            remaining = 100 - sum(point.values())
-            for i, element in enumerate(elements):
-                capacity = region[element][1] - point[element]
-                later = sum(region[e][1] - point[e] for e in elements[i + 1:])
-                addition = rng.uniform(max(0, remaining - later), min(capacity, remaining))
-                point[element] += addition
-                remaining -= addition
-        try:
-            point = complete_composition(scenario, point, region)
-        except ValueError:
-            continue  # 有总量约束的区间并不保证每次随机采样都可行。
-        key = tuple(sorted((e, v) for e, v in point.items() if v))
-        if key not in seen:
-            result.append({**template, 'composition': point, 'sampled': True})
-            seen.add(key)
-    return result
+            usage['model_evaluations'] += 1
+            save(folder.parent / 'usage.json', usage)
+            result = evaluate(config['scenario'], composition, case['protocol'], folder / cid / f'case_{case_index:02}',
+                              tool_ids=case['tools'])
+            record = {**result, 'kind': 'model', 'status': 'diagnostic',
+                      'source': json.dumps(result['tools'], ensure_ascii=False),
+                      'summary': '模型预测；不是实测，也不证明机理成立。',
+                      'composition': composition, 'protocol': case['protocol']}
+        record.update(id=eid, protocol_case_id=name)
+        cache.setdefault(key, deepcopy(record))
+        evidence.append(record)
+        for metric, value in record['metrics'].items():
+            value = value.get('value') if isinstance(value, dict) else value
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                values[f'{name}/{metric}'] = value
+    common = {'scenario': config['scenario']['id'], 'version': 1, 'status': 'proposed'}
+    candidate = {**common, 'id': cid, 'kind': 'candidate', 'statement': design['plan']['question'],
+                 'composition': composition, 'role': design['role'], 'hypothesis_id': design['hypothesis_id'],
+                 'hypothesis_version': 1, 'plan_id': pid, 'evidence_ids': [e['id'] for e in evidence],
+                 'sampled': composition != design['composition'], 'protocol_case_ids': list(cases)}
+    plan = {**design['plan'], **common, 'id': pid, 'kind': 'experiment_plan',
+            'statement': design['plan']['question'], 'candidate_id': cid, 'protocol_case_ids': list(cases)}
+    delta = {'nodes': [candidate, plan], 'evidence': evidence,
+             'links': [{'source': design['hypothesis_id'], 'target': cid, 'relation': 'tested_by'},
+                       {'source': cid, 'target': pid, 'relation': 'planned_by'}]}
+    return delta, {'id': cid, 'metrics': values}
 
 
-def evaluate_designs(designs, config, folder, prefix, evaluate, usage):
-    nodes, evidence, links = [], [], []
-    for index, design in enumerate(designs, 1):
-        cid, pid, eid = (f'{prefix}-{kind}{index:03}' for kind in ('C', 'P', 'M'))
-        usage['model_evaluations'] += 1
-        save(folder.parent / 'usage.json', usage)
-        result = evaluate(config['scenario'], design['composition'], config['space']['protocol'], folder / cid)
-        evidence.append({'id': eid, 'kind': 'model', 'status': 'diagnostic',
-                         'source': json.dumps(result['tools'], ensure_ascii=False),
-                         'summary': '模型预测；不是实测，也不证明机理成立。',
-                         'composition': design['composition'], 'protocol': config['space']['protocol'], **result})
-        common = {'scenario': config['scenario']['id'], 'version': 1, 'status': 'proposed'}
-        nodes.append({**common, 'id': cid, 'kind': 'candidate', 'statement': design['plan']['question'],
-                      'composition': design['composition'], 'role': design['role'],
-                      'hypothesis_id': design['hypothesis_id'], 'hypothesis_version': 1,
-                      'plan_id': pid, 'evidence_ids': [eid], 'sampled': design.get('sampled', False)})
-        nodes.append({**design['plan'], **common, 'id': pid, 'kind': 'experiment_plan',
-                      'statement': design['plan']['question'], 'candidate_id': cid})
-        links.extend([{'source': design['hypothesis_id'], 'target': cid, 'relation': 'tested_by'},
-                      {'source': cid, 'target': pid, 'relation': 'planned_by'}])
-        save(folder / 'evaluated.json', {'nodes': nodes, 'evidence': evidence, 'links': links})
-    return {'nodes': nodes, 'evidence': evidence, 'links': links}
+def search_candidates(designs, hypotheses, config, folder, prefix, evaluate, usage, cache, prior, round_index,
+                      searcher=search.run):
+    """数值搜索与科研记录的唯一接点；建议的形态不参与节点构造。"""
+    spaces, templates = search_spaces(designs, hypotheses, config)
+    bounds = {space['id']: space['bounds'] for space in spaces}
+    delta = {'nodes': [], 'evidence': [], 'links': []}
+    count = 0
+
+    def predict(space_id, composition):
+        nonlocal count
+        if count >= config['evaluations']:
+            raise ValueError('搜索回调超过本轮评估预算')
+        composition = complete_composition(config['scenario'], composition, bounds[space_id])
+        count += 1
+        addition, observation = evaluate_candidate(templates[space_id], composition, config, folder, prefix,
+                                                  count, evaluate, usage, cache)
+        append_delta(delta, addition)
+        save(folder / 'evaluated.json', delta)
+        return observation
+
+    options = {'seed': round_index, **config['space'].get('search', {})}
+    result = searcher(spaces, predict, search_objectives(config), config['evaluations'], options=options, prior=prior)
+    save(folder / 'search.json', result)
+    save(folder / 'evaluated.json', delta)
+    return delta, result
 
 
-def delivery(review, delta, scenario, minimum):
-    """独立于语言模型：提名必须有已接受的预测与完整实验计划。"""
+def delivery(review, delta, config):
+    """按实际预测条件检查候选；不同条件的指标不能拼成一次达标。"""
     selected = review.get('recommended_candidate_ids', [])
     nodes, evidence = {n['id']: n for n in delta['nodes']}, {e['id']: e for e in delta['evidence']}
+    scenario, cases = config['scenario'], config['space']['protocol_cases']
     reasons = []
     recipes = {tuple(sorted((e, v) for e, v in nodes[cid]['composition'].items() if v)) for cid in selected
                if cid in nodes and nodes[cid].get('kind') == 'candidate'}
-    if len(recipes) < minimum:
-        reasons.append(f'需要至少 {minimum} 个不同成分的候选，当前 {len(recipes)} 个')
+    if len(recipes) < config['recommendations']:
+        reasons.append(f'需要至少 {config["recommendations"]} 个不同成分的候选，当前 {len(recipes)} 个')
+    screening = [m for m in scenario['metrics'] if m['role'] == 'screening' and m.get('target') is not None]
+    available = {key for case in cases.values() for key in case['metrics']}
+    missing = {m['key'] for m in screening} - available
+    if missing:
+        reasons.append(f'本批工具组合未覆盖名义筛选指标 {sorted(missing)}')
     for candidate_id in selected:
         candidate = nodes.get(candidate_id, {})
         plan = nodes.get(candidate.get('plan_id'))
@@ -279,18 +316,24 @@ def delivery(review, delta, scenario, minimum):
         missing = required - set(plan['measurements'])
         if missing:
             reasons.append(f'{candidate_id}: 最终计划未覆盖目标端点 {sorted(missing)}')
-        # 只检查登记为 screening 的名义门槛；diagnostic/measurement 不参与预测筛除。
-        metrics = evidence[candidate['evidence_ids'][0]]['metrics']
-        for spec in scenario['metrics']:
-            if spec.get('role') != 'screening' or spec.get('target') is None:
+        by_case = {evidence[eid]['protocol_case_id']: evidence[eid] for eid in candidate['evidence_ids']}
+        for name, case in cases.items():
+            record = by_case.get(name)
+            if (record is None or record['composition'] != candidate['composition']
+                    or record['protocol'] != case['protocol']
+                    or {t['id'] for t in record['tools']} != set(case['tools'])):
+                reasons.append(f'{candidate_id}/{name}: 缺少相符成分、条件和工具的预测证据')
                 continue
-            metric = metrics.get(spec['key'], {})
-            value = metric.get('value') if isinstance(metric, dict) else metric
-            target, op = spec['target'], spec['op']
-            passed = value is not None and {'>=': lambda: value >= target, '>': lambda: value > target,
-                       '<=': lambda: value <= target, '<': lambda: value < target}[op]()
-            if not passed:
-                reasons.append(f'{candidate_id}: {spec["key"]} 未满足名义筛选')
+            for spec in screening:
+                if spec['key'] not in case['metrics']:
+                    continue
+                metric = record['metrics'].get(spec['key'])
+                value = metric.get('value') if isinstance(metric, dict) else metric
+                target, op = spec['target'], spec['op']
+                passed = value is not None and {'>=': lambda: value >= target, '>': lambda: value > target,
+                           '<=': lambda: value <= target, '<': lambda: value < target}[op]()
+                if not passed:
+                    reasons.append(f'{candidate_id}/{name}: {spec["key"]} 未满足名义筛选')
     return {'accepted': not reasons, 'reasons': reasons, 'candidate_ids': selected if not reasons else []}
 
 
@@ -325,7 +368,7 @@ def plan_searches(call, research, context, limit):
                 'transfer_contract': fields(link.get('transfer_contract', {}),
                                             'shared_mechanism source_conditions target_conditions')}
                for link in context['links']]
-    answer = call('search', {**research, 'forest': {'hypotheses': questions, 'links': bridges},
+    answer = call('queries', {**research, 'forest': {'hypotheses': questions, 'links': bridges},
                              'query_limit': limit})
     return answer['queries'][:limit]
 
@@ -365,33 +408,37 @@ def review_hypotheses(call, research, proposal, context):
                                                                 context['evidence']))}})
 
 
-def design_candidates(call, research, hypotheses, evidence, config, round_index):
-    """设计候选与待测计划，并在准入假设范围内展开补充采样。"""
+def design_candidates(call, research, hypotheses, evidence, config):
+    """提出明确设计、对照和允许探索的范围，数值搜索单独执行。"""
     answer = call('design', {**research, 'hypotheses': hypothesis_reading(hypotheses),
         'literature': literature_reading(cited_evidence(hypotheses, evidence)),
         'tools': [{key: value for key, value in tool.items() if key not in {'asset', 'kind'}}
                   for tool in config['scenario']['tools']],
         'evaluations': config['evaluations']})
-    return expand_designs(answer['designs'], hypotheses, config, round_index)
+    return answer['designs']
 
 
-def review_candidates(call, scene, hypotheses, evidence, evaluated, previous_pool):
+def review_candidates(call, research, hypotheses, evidence, evaluated, previous_pool, search_result):
     """结合文献与真实预测，复审本轮结果及本批此前接受的候选。"""
-    return call('review', {'scenario': scene, 'hypotheses': hypothesis_reading(hypotheses),
+    return call('review', {'scenario': research['scenario'],
+        'protocol_cases': research['space']['protocol_cases'],
+        'search': {'recommendations': search_result['recommendations'], 'trace': search_result['trace']},
+        'hypotheses': hypothesis_reading(hypotheses),
         'literature': literature_reading(cited_evidence(hypotheses, evidence)),
         **review_reading(evaluated, previous_pool)})
 
 
 def run(config, output, *, ask=services.ask, literature=services.literature,
-        evaluate=evaluate_model, initial_state=None):
+        evaluate=evaluate_model, initial_state=None, searcher=search.run):
     """顺序执行研究阶段，管理森林增量、预算退出和交付结束。"""
     output = Path(output)
     state = store.load() if initial_state is None else initial_state
     base_revision = state['revision']
     instructions, total = prompts(), {'nodes': [], 'evidence': [], 'links': []}
-    feedback, usage, nominations = {}, {'llm_calls': 0, 'model_evaluations': 0, 'literature_queries': 0}, []
+    feedback, usage, nominations = {}, {'llm_calls': 0, 'candidate_evaluations': 0,
+                                      'model_evaluations': 0, 'literature_queries': 0}, []
     status, checks = 'budget_exhausted', {'accepted': False, 'reasons': ['尚未交付']}
-    rounds = []
+    rounds, search_history, cache = [], [], {}
     try:
         for index in range(1, config['rounds'] + 1):
             if usage['llm_calls'] >= config['llm_calls']:
@@ -432,22 +479,24 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
                 feedback = {'reason': admission['reason'], 'next_question': '继续研究假设与证据'}
                 rounds.append({'round': index, 'status': 'hypotheses_only'})
                 continue
-            points = design_candidates(call, research, admitted['nodes'], state['evidence'].values(), config, index)
-            evaluated = evaluate_designs(points, config, folder, prefix, evaluate, usage)
+            designs = design_candidates(call, research, admitted['nodes'], state['evidence'].values(), config)
+            evaluated, search_result = search_candidates(designs, admitted['nodes'], config, folder, prefix,
+                evaluate, usage, cache, search_history, index, searcher)
+            search_history.extend(search_result['observations'])
             previous_pool = candidate_pool(total)
             prior_ids = {n['hypothesis_id'] for n in previous_pool['nodes'] if n['kind'] == 'candidate'}
             hypotheses = [n for n in total['nodes'] if n['id'] in prior_ids or n in admitted['nodes']]
-            review = review_candidates(call, research['scenario'], hypotheses, state['evidence'].values(),
-                                       evaluated, previous_pool)
+            review = review_candidates(call, research, hypotheses, state['evidence'].values(),
+                                       evaluated, previous_pool, search_result)
             approved = accepted(evaluated, review)
             state = store.apply(state, evaluated, review)
             append_delta(total, approved)
             nominations = review.get('recommended_candidate_ids', [])
             append_delta(previous_pool, approved)
-            checks = delivery(review, previous_pool, config['scenario'], config['recommendations'])
+            checks = delivery(review, previous_pool, config)
             save(folder / 'delivery.json', checks)
             feedback = {'reason': review['reason'], 'next_question': review.get('next_question'), 'delivery': checks}
-            rounds.append({'round': index, 'evaluated': len(points), 'review': review, 'delivery': checks})
+            rounds.append({'round': index, 'evaluated': len(search_result['observations']), 'review': review, 'delivery': checks})
             save(output / 'progress.json', {'usage': usage, 'rounds': rounds})
             if review.get('finish') is True and checks['accepted']:
                 status = 'frozen_pending_measurement'

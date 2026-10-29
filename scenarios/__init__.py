@@ -76,7 +76,7 @@ def complete_composition(scenario, composition, ranges=None):
     return result
 
 
-def effective_protocol(scenario, protocol):
+def effective_protocol(scenario, protocol, *, tool_ids=None):
     """Combine declared conditions with the fixed scenario comparison protocol."""
     scene = load(scenario) if isinstance(scenario, str) else scenario
     if not isinstance(protocol, dict):
@@ -87,14 +87,49 @@ def effective_protocol(scenario, protocol):
             raise ValueError(f"{key} is fixed by scenario {scene['id']}: {value!r}")
     from .tools import validate_protocol
     result = {**deepcopy(fixed), **deepcopy(protocol)}
-    validate_protocol(scene, result)
+    validate_protocol(scene, result, tool_ids=tool_ids)
     return result
 
 
-def evaluate(scenario, composition, protocol, workdir):
+def normalize_protocol_cases(scenario, space):
+    """Resolve named conditions and tool selections into independent comparisons."""
+    from .tools import select_tools, tool_metrics
+    scene = load(scenario) if isinstance(scenario, str) else scenario
+    base = space.get("protocol", {})
+    if not isinstance(base, dict):
+        raise ValueError("protocol must be an object")
+    cases = space.get("protocol_cases", {"default": {"protocol": {}}})
+    if not isinstance(cases, dict) or not cases:
+        raise ValueError("protocol_cases must contain at least one named condition")
+
+    def merge(base, override):
+        result = deepcopy(base)
+        for key, value in override.items():
+            result[key] = (merge(result[key], value)
+                           if isinstance(result.get(key), dict) and isinstance(value, dict)
+                           else deepcopy(value))
+        return result
+
+    result = {}
+    for name, case in cases.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Every protocol case needs a nonempty name")
+        if not isinstance(case, dict) or not isinstance(case.get("protocol", {}), dict):
+            raise ValueError(f"Protocol case {name!r} needs a protocol object")
+        selected = select_tools(scene, case.get("tools"))
+        ids = [tool["id"] for tool in selected]
+        result[name] = {
+            **deepcopy(case), "tools": ids,
+            "protocol": effective_protocol(scene, merge(base, case.get("protocol", {})), tool_ids=ids),
+            "metrics": tool_metrics(scene, ids),
+        }
+    return result
+
+
+def evaluate(scenario, composition, protocol, workdir, *, tool_ids=None):
     """Run current property tools; write their raw outputs under this candidate's workdir."""
     from .tools import evaluate as run_tools
     scene = load(scenario) if isinstance(scenario, str) else scenario
     recipe = complete_composition(scene, composition)
-    conditions = effective_protocol(scene, protocol)
-    return run_tools(scene, recipe, conditions, Path(workdir))
+    conditions = effective_protocol(scene, protocol, tool_ids=tool_ids)
+    return run_tools(scene, recipe, conditions, Path(workdir), tool_ids=tool_ids)

@@ -7,8 +7,8 @@ from pathlib import Path
 import sys
 from urllib.parse import quote
 
-from campaign import engine, services
-from scenarios import load, validate_ranges, effective_protocol
+from campaign import engine, search, services
+from scenarios import load, validate_ranges, normalize_protocol_cases
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,7 +22,7 @@ def arguments(argv=None):
     question.add_argument('--question-file', type=Path, default=ROOT / 'campaign/question.md')
     parser.add_argument('--space', type=Path, default=ROOT / 'campaign/space.json')
     parser.add_argument('--rounds', type=int, default=3)
-    parser.add_argument('--evaluations', type=int, default=12, help='每轮最多预测的成分数；0 表示只研究假设')
+    parser.add_argument('--evaluations', type=int, default=12, help='每轮成分设计评估上限；每点执行所有协议，0 表示只研究假设')
     parser.add_argument('--literature-queries', type=int, default=2, help='每轮文献查询数；0 跳过检索，每个已配置服务各调用一次')
     parser.add_argument('--llm-calls', type=int, default=15, help='本批语言模型请求上限，不自动重试')
     parser.add_argument('--recommendations', type=int, default=3, help='本批至少交付的不同成分候选数；优先于自然语言中的数量描述')
@@ -43,7 +43,9 @@ def configuration(args):
     scene = load(args.scenario)
     space = json.loads(args.space.read_text())
     space['composition_ranges_wt_pct'] = validate_ranges(scene, space['composition_ranges_wt_pct'])
-    space['protocol'] = effective_protocol(scene, space.get('protocol', {}))
+    space['protocol_cases'] = normalize_protocol_cases(scene, space)
+    if 'search' in space:
+        space['search'] = search.settings(space['search'])
     question = args.question if args.question is not None else args.question_file.read_text()
     if not question.strip():
         raise ValueError('研究问题不能为空')
@@ -66,13 +68,12 @@ def write_report(output, config, result):
              f'本批交付目标：至少 **{config["recommendations"]}** 个不同成分候选（以 --recommendations 为准）。', '',
              f'通过交付检查的候选：**{len(selected)}**。', '',
              '性能数值均为模型输出。待测计划不代表已取得实测结果；预算结束不代表科学收敛。', '',
-             f'实际调用：LLM {result["usage"]["llm_calls"]} 次；文献查询 {result["usage"]["literature_queries"]} 次；成分评估 {result["usage"]["model_evaluations"]} 次。', '',
+             f'实际调用：LLM {result["usage"]["llm_calls"]} 次；文献查询 {result["usage"]["literature_queries"]} 次；成分设计评估 {result["usage"]["candidate_evaluations"]} 次；成分×条件模型组调用 {result["usage"]["model_evaluations"]} 次。', '',
              f'完整输入见 [input.json]({batch_link}/input.json)，研究记录见 [result.json]({batch_link}/result.json)。', '']
     if not selected:
         lines.extend(['本批没有形成通过交付检查的最终推荐；中间候选保存在各轮目录中。', ''])
     for candidate_id in selected:
         node = nodes[candidate_id]
-        diagnostic = evidence[node['evidence_ids'][0]]
         plan = nodes[node['plan_id']]
         hypothesis = nodes[node['hypothesis_id']]
         lines.extend([f'## {candidate_id}', '',
@@ -80,13 +81,17 @@ def write_report(output, config, result):
                       hypothesis['statement'], '',
                       f'适用条件：{hypothesis["scope"].get("conditions", "见完整假设记录")}', '',
                       '成分（wt.%；预测使用下列完整精度）：', '',
-                      '；'.join(f'{element} {value!r}' for element, value in node['composition'].items()), '',
-                      '| 指标 | 模型输出 | 单位 |', '|---|---:|---|'])
-        for key, metric in diagnostic['metrics'].items():
-            if isinstance(metric, dict):
-                lines.append(f'| {key} | {metric.get("value", "未知")} | {metric.get("unit", "")} |')
-        lines.extend(['', '模型预测使用的条件：`' + json.dumps(diagnostic['protocol'], ensure_ascii=False) + '`。', '',
-                      f'待实测工艺计划：{plan["process"]}', '', f'研究问题：{plan["question"]}', '',
+                      '；'.join(f'{element} {value!r}' for element, value in node['composition'].items()), ''])
+        for eid in node['evidence_ids']:
+            diagnostic = evidence[eid]
+            lines.extend([f'预测条件：`{diagnostic["protocol_case_id"]}`', '',
+                          '`' + json.dumps(diagnostic['protocol'], ensure_ascii=False) + '`', '',
+                          '| 指标 | 模型输出 | 单位 |', '|---|---:|---|'])
+            for key, metric in diagnostic['metrics'].items():
+                if isinstance(metric, dict):
+                    lines.append(f'| {key} | {metric.get("value", "未知")} | {metric.get("unit", "")} |')
+            lines.append('')
+        lines.extend([f'待实测工艺计划：{plan["process"]}', '', f'研究问题：{plan["question"]}', '',
                       f'干预：{plan["intervention"]}；控制：{plan["controls"]}', '',
                       f'测量：{", ".join(plan["measurements"])}', '',
                       f'支持：{plan["support"]}', '', f'削弱：{plan["weaken"]}', '', f'未决：{plan["unresolved"]}', ''])

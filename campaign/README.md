@@ -1,6 +1,6 @@
 # 启动一次研究
 
-这里的输入只有两部分：`question.md` 描述研究问题；`space.json` 声明 `composition_ranges_wt_pct` 和 `protocol`，也可附上 `notes` 等说明。指标与工具从场景加载，不在问题里重复注册。直接传 `--question '自然语言'` 可以替代文件。
+这里的输入只有两部分：`question.md` 描述研究问题；`space.json` 声明 `composition_ranges_wt_pct` 和 `protocol`，可选 `protocol_cases` 配置多组条件、`search` 配置搜索，也可附上 `notes` 等说明。指标与工具从场景加载，不在问题里重复注册。直接传 `--question '自然语言'` 可以替代文件。
 
 `run.sh` 的参数行是日常入口，`bash campaign/run.sh --help` 查看全部参数。命令末尾同名参数覆盖脚本中的设置。默认问题和范围文件是可编辑的无磁钢示例；切换耐蚀钢或高熵场景时同时传对应范围文件。
 
@@ -11,16 +11,16 @@
 | `--question` / `--question-file` | 自然语言要求，二选一 |
 | `--space` | 本次元素范围与实际或未知条件 |
 | `--rounds 3` | 最多科研轮次 |
-| `--evaluations 12` | 每轮最多评估的成分数；`0` 表示只研究假设 |
+| `--evaluations 12` | 每轮最多评估的成分设计数，每个设计评估全部条件组；同配方不同计划可分别计数；`0` 表示只研究假设 |
 | `--literature-queries 2` | 每轮查询数；每个已配置文献服务各请求一次；`0` 跳过检索 |
 | `--llm-calls 15` | 整批LLM请求上限，可为 `0`；完整一轮最多5次，用完即保存结束，无自动重试 |
 | `--recommendations 3` | 本批最终至少交付的不同成分候选数，可跨轮累计；优先于自然语言中的数量描述 |
 | `--prepare-only` | 只装配并保存输入，完全离线 |
 | `--keep-private` | 研究完成后不合入正式森林 |
 
-代码阅读顺序：`run.py` 读取输入与写报告 → `engine.py` 的 `run()` 查看研究顺序 → 各阶段函数查看具体输入输出 → `services.py` 请求外部服务。固定提示词完整放在 `prompts.md`；每轮实际请求和回答保存在输出中。`forest/store.py` 处理接受记录的最终合并。
+代码阅读顺序：`run.py` 读取输入与写报告 → `engine.py` 的 `run()` 查看研究顺序 → 各阶段函数查看具体输入输出。`search.py` 负责选点和搜索建议，`services.py` 请求外部服务。固定提示词完整放在 `prompts.md`；每轮实际请求和回答保存在输出中。`forest/store.py` 处理接受记录的最终合并。
 
-阶段函数都在 `engine.py`：`plan_searches` 规划检索 → `retrieve_literature` 获取文献 → `propose_hypotheses` 提出假设 → `review_hypotheses` 准入审查 → `design_candidates` 设计与采样 → `evaluate_designs` 真实模型预测 → `review_candidates` 研究复审。`research_context` 整理共同场景资料；`run()` 管理轮次、预算、反馈和森林更新。调试时直接在所需阶段函数内打断点。
+阶段函数都在 `engine.py`：`plan_searches` 规划检索 → `retrieve_literature` 获取文献 → `propose_hypotheses` 提出假设 → `review_hypotheses` 准入审查 → `design_candidates` 设计假设内的研究空间 → `search_candidates` 自适应选点并调用真实模型 → `review_candidates` 研究复审。`research_context` 整理共同场景资料；`run()` 管理轮次、预算、反馈和森林更新。调试时直接在所需阶段函数内打断点。
 
 `--recommendations` 是候选数量的唯一口径，程序将它作为 `requested_candidates` 传给各阶段并写入报告。默认问题不固定数量；即使自写问题里保留了其他数量，仍以这个参数为准。它是交付目标，`--evaluations` 等参数是调用上限；预算不足时保存已有成果，不保证凑齐候选。
 
@@ -33,14 +33,14 @@ system 给出共同规则和本阶段任务，user 提供完成这个任务所�
 | 检索 | 问题、实际范围与条件、简短假设和关系、待查反馈与查询上限 |
 | 生成假设 | 相关森林假设、已有证据、本轮文献片段和出处 |
 | 准入 | 提议假设及其引用的新证据、相关来源假设和已接受的证据 |
-| 设计 | 准入假设、它们引用的文献、实际范围与预测协议、指标和评估预算 |
-| 复审 | 当前及本批此前候选的配方、计划、真实预测、所据假设与文献；共同工具、协议和局限只提供一次 |
+| 设计 | 准入假设、它们引用的文献、实际范围与各预测条件组、指标和评估预算 |
+| 复审 | 当前及本批此前候选的配方、计划、逐条件预测、搜索建议、所据假设与文献；共同工具、协议和局限只提供一次 |
 
 原始检索响应、模型输出及研究记录仍保存在批次目录中；发给 LLM 的资料去掉重复包装和存储元数据。文献正文不同时重复出现在 `text` 与 `raw`，相关依据也不只传一个 `evidence_id`。复审保留本批此前全部获准候选，不按最近几条截掉候选池。
 
 ## 声明范围与条件
 
-成分均为 wt.%。钢铁范围只需列参与研究的元素，未列出的非Fe元素按 `[0,0]` 处理；配方可省略零含量元素，Fe按余量闭合。HEA显式列出选用元素，不默认Fe基体。假设再声明自身范围，设计和补充采样只能在其中进行。采样使用固定随机种子的有界随机点；它是探索工具，不是贝叶斯优化，也不把采样密度当作科学证据。
+成分均为 wt.%。钢铁范围只需列参与研究的元素，未列出的非Fe元素按 `[0,0]` 处理；配方可省略零含量元素，Fe按余量闭合。HEA显式列出选用元素，不默认Fe基体。假设再声明自身范围，设计和搜索只能在其中进行。
 
 无磁钢未知力学条件写 `"mechanical_conditions": {}`，已知条件用该工具支持的数值字段。HEA例如：
 
@@ -51,7 +51,57 @@ system 给出共同规则和本阶段任务，user 提供完成这个任务所�
 }
 ```
 
-一个批次固定一种预测协议；不同测试温度分别启动批次。HEA四项预测只报告，不按合同硬门槛筛除。探索与对照可按研究问题选择测量端点，最终推荐的待测计划须覆盖场景验收端点；模型能算出数值不代表制造状态已经确定。
+`protocol` 是共同条件。不填 `protocol_cases` 时，全部登记工具使用该条件；多条件时按下面的结构添加到 `space.json`：
+
+```json
+{
+  "protocol_cases": {
+    "magnetic": {
+      "tools": ["property-lgbm-v1-remanence", "property-lgbm-v1-relative-permeability"]
+    },
+    "room": {
+      "protocol": {"mechanical_conditions": {"test_temperature_C": 25}},
+      "tools": ["nms-plate-mechanical"]
+    },
+    "hot": {
+      "protocol": {"mechanical_conditions": {"test_temperature_C": 300}},
+      "tools": ["nms-plate-mechanical"]
+    }
+  }
+}
+```
+
+每组 `protocol` 递归覆盖共同条件，省略时继承共同条件；省略 `tools` 表示该场景全部工具。每个设计都使用同一组条件；条件组记录其工具实际提供的指标。示例中的温度只是输入写法，是否适合研究由模型适用范围和科学复审判断。无磁钢磁性工具只使用成分，力学工具使用声明的条件；将磁性单列一组可避免在不同温度下重复计算同一成分描述。耐蚀工具仍使用登记的固定比较条件。HEA 的强度与延伸率工具需要工艺和测试温度；单独调用密度工具可使用空协议，该模型不使用工艺或测试温度。
+
+screening 指标在各自条件组检查；不能拿 room 的强度和 hot 的延伸率拼成同一条件下达标。measurement 指标进入待实测计划，diagnostic 指标只报告、不参与 BO 或 Pareto 排名。HEA 当前四项指标均为 diagnostic，默认使用空间填充。探索与对照可按研究问题选择测量端点，最终推荐的待测计划须覆盖场景验收端点；模型能算出数值不代表制造状态已经确定。
+
+## 搜索与代表选择
+
+LLM 设计给出明确成分点与实验计划。需要扩大探索时，同时给出 `search_ranges_wt_pct` 和 `plan.vary_elements`；只在该范围内改变这些元素，其余非余量元素保持不变。没有搜索范围的设计只评估明确点，算法不会自行扩大研究范围。
+
+`space.json` 可选的搜索设置如下。未配置 `search` 时，随机种子使用轮次；配置后，省略的字段采用下列默认值：
+
+```json
+{
+  "search": {
+    "method": "auto",
+    "pool_size": 256,
+    "initial": 6,
+    "batch_size": 4,
+    "representatives": null,
+    "seed": 0,
+    "exploration_fraction": 0.25
+  }
+}
+```
+
+`auto` 在存在可排序 screening 指标时使用 BO，否则用 `space_filling`；也可显式选择 `bo` 或 `space_filling`。`pool_size` 是每次生成的内部候选点数，另加可行边界点；`initial` 是启动 BO 所需的空间内已观测点数，`batch_size` 是每次更新后选择的点数。`exploration_fraction` 为每批保留一部分空间覆盖点；`representatives` 控制供复审参考的代表数量，`null` 表示不额外限制，`0` 表示不提供代表建议。`seed` 控制可重复的采样。实际预测始终受 `--evaluations` 限制，不要求预算大于初始点数。
+
+空间填充使用拉丁超立方内部点、可行边界点与最大最小距离选点。BO 使用本批已产生的预测选择下一批；多目标按各条件的指标分别比较，代表选择兼顾 Pareto 前沿、指标极值和成分多样性，对照与区分探针保留空间覆盖，不按达标程度淘汰。它们是选点与研究排序方法，不增加预测的证据等级。复审仍读取完整候选池，代表数量不裁剪科学记录，也不代替 `--recommendations`。
+
+每轮 `search.json` 保存观测、搜索建议和选点轨迹。`search.py` 的 `run(spaces, evaluate, objectives, budget, *, options=None, prior=())` 只依赖通用搜索输入和评价回调，不读取场景、森林或文件；`recommend()` 单独决定建议形态。当前建议以 `kind: "point"`、`point`、`observation_ids`、`space_id` 表示，流程透传给复审。以后可在这一层实现范围建议；科学候选仍绑定实际预测点，范围不能因为内部几个点合格就被视为整体合格。
+
+预测消耗分别记录为 `candidate_evaluations`（成分设计数）与 `model_evaluations`（实际调用的成分 × 条件组数）。例如每轮 10 个设计、3 组条件，最多执行 30 次模型组调用；同批完全相同的成分、协议和工具组合复用已有结果并保留原证据引用，不读取其他批次候选。
 
 ## 配置真实服务
 
@@ -122,7 +172,7 @@ bash campaign/run.sh --version debug-1 \
 
 ## 调试与结束
 
-LLM 预算逐次计算：例如 `--llm-calls 1` 可只运行第一步，已完成的阶段仍落盘；`0` 不调用 LLM。`--evaluations 0` 保留假设研究与准入，跳过设计和预测。预测预算按本轮设计顺序执行，超出的设计保留在 `design.json` 中但不执行。达到预算正常结束为 `budget_exhausted`；已接受记录可合入森林，调试时使用 `--keep-private`。
+LLM 预算逐次计算：例如 `--llm-calls 1` 可只运行第一步，已完成的阶段仍落盘；`0` 不调用 LLM。`--evaluations 0` 保留假设研究与准入，跳过设计和预测。预测先考虑明确设计，再在剩余预算内搜索；超出预算的设计保留在 `design.json` 中但不执行。达到预算正常结束为 `budget_exhausted`；已接受记录可合入森林，调试时使用 `--keep-private`。
 
 先用新版本执行 `--prepare-only` 检查范围和协议。正式运行失败时保留输入、已完成的各阶段JSON、逐候选原始输出和 `status.json`；修正输入或代码后开新版本重跑。没有隐式续跑、自动加预算或切换模型的分支。
 
