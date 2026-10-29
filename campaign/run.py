@@ -59,6 +59,8 @@ def configuration(args):
 
 def write_report(output, config, result):
     """报告只引用真实产物；自由文本科研解释保留在逐轮审查意见里。"""
+    report_dir = output.parent / 'reports' / config['version']
+    batch_link = f'../../{config["version"]}'
     delta = result['delta']
     nodes = {node['id']: node for node in delta['nodes']}
     evidence = {record['id']: record for record in delta['evidence']}
@@ -68,7 +70,7 @@ def write_report(output, config, result):
              config['question'], '', f'通过交付检查的候选：**{len(selected)}**。', '',
              '性能数值均为模型输出。待测计划不代表已取得实测结果；预算结束不代表科学收敛。', '',
              f'实际调用：LLM {result["usage"]["llm_calls"]} 次；文献查询 {result["usage"]["literature_queries"]} 次；成分评估 {result["usage"]["model_evaluations"]} 次。', '',
-             '完整输入见 [input.json](input.json)，研究记录见 [result.json](result.json)。', '']
+             f'完整输入见 [input.json]({batch_link}/input.json)，研究记录见 [result.json]({batch_link}/result.json)。', '']
     if not selected:
         lines.extend(['本批没有形成通过交付检查的最终推荐；中间候选保存在各轮目录中。', ''])
     for candidate_id in selected:
@@ -100,13 +102,19 @@ def write_report(output, config, result):
     lines.extend(['', '## 逐轮结论', ''])
     for row in result['rounds']:
         lines.append(f'- 第{row["round"]}轮：{row.get("review", {}).get("reason", row.get("status"))}')
-    (output / '候选报告.md').write_text('\n'.join(lines) + '\n')
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / '候选报告.md'
+    with report.open('x', encoding='utf-8') as handle:
+        handle.write('\n'.join(lines) + '\n')
+    return report
 
 
 def main(argv=None):
     args = arguments(argv)
     config = configuration(args)
     output = ROOT / 'outputs' / args.version
+    if (output.parent / 'reports' / args.version).exists():
+        raise FileExistsError(f'该版本的最终文档已存在：{args.version}')
     output.mkdir(parents=True, exist_ok=False)
     engine.save(output / 'input.json', config)
     (output / 'question.md').write_text(config['question'] + '\n')
@@ -118,12 +126,13 @@ def main(argv=None):
     engine.save(output / 'status.json', {'status': 'running', 'version': args.version})
     try:
         result = engine.run(config, output)
-        write_report(output, config, result)
+        report = write_report(output, config, result)
     except Exception as error:
         engine.save(output / 'status.json', {'status': 'failed', 'error': str(error), 'type': type(error).__name__})
         raise
-    engine.save(output / 'status.json', {'status': result['status'], 'version': args.version})
-    print(f'{result["status"]}：{output / "候选报告.md"}')
+    engine.save(output / 'status.json', {'status': result['status'], 'version': args.version,
+                                       'report': str(report.relative_to(ROOT))})
+    print(f'{result["status"]}：{report}')
     return 0
 
 

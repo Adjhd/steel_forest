@@ -35,16 +35,72 @@
 
 一个批次固定一种预测协议；不同测试温度分别启动批次。HEA四项预测只报告，不按合同硬门槛筛除。所有场景的实测要求仍须进入实验计划；模型能算出数值不代表制造状态已经确定。
 
-## 外部服务
+## 配置真实服务
 
-凭据通过当前 shell 环境提供，不写入项目或输出：
+所有命令都在本项目根目录执行。先复制配置模板，填写自己的服务地址、模型名和密钥，再导入当前 shell：
 
-- `LITELLM_API_BASE`、`LITELLM_API_KEY`、`STEEL_FOREST_LLM_MODEL`：JSON LLM。
-- `BOHR_ACCESS_KEY`：LKM；`DPRAG_API_KEY`：DPRAG。至少配置一个文献服务，两者都有则都使用。
-- 按需设置 `LITELLM_SOCKS5_PROXY`；`STEEL_FOREST_LLM_TIMEOUT_SEC` 默认180秒。
-- `LKM_API_BASE`、`DPRAG_API_BASE` 可指定服务地址。
+```bash
+cd /mnt/vepfs/Djinhan/Agentic_data/steel_forest_hf
+cp -n .env.example .env    # 已有 .env 时保留，直接编辑
+# 用编辑器填写 .env，然后执行：
+set -a
+source .env
+set +a
+```
 
-只有正式运行才发送研究问题、选取的森林假设和工具结果。文献服务返回线索与片段，保持未完成原文核验的资格。模型输出作为模型诊断记录，不写成实测。
+`run.sh` 不自动读取 `.env`，每个新终端都需要重新导入。`.env` 已被 Git 忽略；不要把真实密钥填入 `.env.example`。服务只从当前进程的环境读取凭据，不将其写入研究输出。
+
+LLM 使用兼容 Chat Completions 的接口，需要填写三项：
+
+| 环境变量 | 填写内容 |
+|---|---|
+| `LITELLM_API_BASE` | 网关给出的 API base，例如 `https://你的网关/v1`；程序追加 `/chat/completions`，也接受以该路径结尾的完整地址 |
+| `LITELLM_API_KEY` | 该网关的访问密钥 |
+| `STEEL_FOREST_LLM_MODEL` | 网关中实际可用的模型 ID，不是物性预测模型名 |
+
+模型需要输出一个 JSON 对象。默认请求含 `response_format={"type":"json_object"}`；若网关不支持这个请求字段，可设置 `STEEL_FOREST_LLM_RESPONSE_FORMAT=none`，但模型回答仍必须是合法 JSON 对象，不能带 Markdown 代码围栏。
+
+文献服务至少配置一个：`BOHR_ACCESS_KEY` 使用 LKM，`DPRAG_API_KEY` 使用 DPRAG；不使用的密钥留空。campaign 使用 `auto`，两项都有值时会依次请求两者，任一调用失败都会停止当前批次，并非自动切换备用服务。返回内容是文献线索或片段，不代表完成原文核验。
+
+可选配置已列在 `.env.example`：LLM 超时默认 180 秒，输入字符上限默认 128000；LKM、DPRAG 的超时分别固定为 60、180 秒。`LITELLM_SOCKS5_PROXY` 只配置 LLM 的专用代理，文献接口不读取它；通用 `HTTP_PROXY` / `HTTPS_PROXY` 等环境变量仍由 `requests` 处理。默认文献地址直接取自当前代码，只有服务方提供其他地址时才覆盖 `LKM_API_BASE` / `DPRAG_API_BASE`。
+
+## 逐项调试
+
+先单独验证接口。以下两段会产生真实服务请求，但不读取森林、不运行物性模型、不创建 campaign 输出。
+
+```bash
+campaign_python="${STEEL_HF_PYTHON:-/mnt/vepfs/Djinhan/conda_env/steel/bin/python}"
+
+# 只发起一次 LLM 请求；正常结果应为 {"ok": true}。
+"$campaign_python" -B - <<'PYTHON'
+from campaign.services import ask
+print(ask('请返回 {"ok": true}。', {"task": "连接测试"}))
+PYTHON
+
+# 检索一个问题；auto 请求所有已配置的文献服务。
+"$campaign_python" -B - <<'PYTHON'
+from campaign.services import literature
+rows = literature('austenitic nonmagnetic steel manganese nitrogen', provider='auto', top_k=2)
+print('线索数：', len(rows))
+for row in rows:
+    print(row['provider'], row['title'], row['url'], row['text'][:160])
+PYTHON
+```
+
+单测一个文献服务时将 `provider='auto'` 改成 `'lkm'` 或 `'dprag'`。返回零条线索表示请求成功但未检索到结果，可换检索词；HTTP 401/403 时检查对应凭据与权限，404 时检查地址拼接和网关路径，JSON 错误时检查模型输出及 `response_format` 支持情况。服务错误不会打印密钥或响应正文，也不会自动重试。
+
+接口通过后，先离线检查，再用一轮、小预算运行真实链路。版本号是示例，每次执行都必须使用未占用的新版本：
+
+```bash
+bash campaign/run.sh --version v20261029.901 --prepare-only
+
+bash campaign/run.sh --version v20261029.902 \
+  --rounds 1 --evaluations 2 --literature-queries 1 \
+  --llm-calls 5 --recommendations 1 --keep-private \
+  --question '在给定范围内研究无磁钢的强塑性与低磁性，形成一个有文献依据的候选及待实测计划。'
+```
+
+真实运行会把研究问题、选取的森林假设和工具结果发送给已配置的服务；`--keep-private` 仍读取当前森林，但不将结果合入 `canonical.json`。这个预算用于检查链路，可能正常结束为 `budget_exhausted`，不保证产生合格推荐。中间结果在 `outputs/<version>/`，最终文档在 `outputs/reports/<version>/候选报告.md`。
 
 ## 调试与结束
 

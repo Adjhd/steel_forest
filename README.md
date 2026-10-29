@@ -19,7 +19,7 @@ bash campaign/run.sh --version v20261029.002 \
   --question '在给定范围内研究无磁钢的强塑性与低磁性，给出可证伪假设和对照实验。'
 ```
 
-每个版本形如 `vYYYYMMDD.NNN`，年月日和三位序号都必须有效；同名输出目录存在时拒绝覆盖。准备检查也占用其版本，真实研究递增序号。最终报告位于 `outputs/<version>/候选报告.md`。运行参数和详细说明见 [`campaign/README.md`](campaign/README.md)。
+每个版本形如 `vYYYYMMDD.NNN`，年月日和三位序号都必须有效；同名批次或报告目录存在时拒绝覆盖。准备检查也占用其版本，真实研究递增序号。最终报告位于 `outputs/reports/<version>/候选报告.md`。运行参数和详细说明见 [`campaign/README.md`](campaign/README.md)。
 
 ## 目录各做一件事
 
@@ -28,7 +28,7 @@ bash campaign/run.sh --version v20261029.002 \
 | [`scenarios/`](scenarios/README.md) | 耐蚀钢、无磁钢、高温高熵合金的指标、元素、比较条件和工具；每场景一个目录、一份活动登记 |
 | [`forest/`](forest/README.md) | 假设森林的读取、审查合并；`canonical.json` 是唯一正式森林，`sources/` 是其文献原文 |
 | [`campaign/`](campaign/README.md) | Bash入口、问题和范围输入、统一提示词、研究流程、外部服务 |
-| [`outputs/`](outputs/README.md) | 每批的输入、每轮中间结果、预测、审查和最终中文报告 |
+| [`outputs/`](outputs/README.md) | 每批的输入、中间结果、预测与审查；最终文档集中在 [`outputs/reports/`](outputs/reports/README.md) |
 | `recycle_bin/` | 隔离被替代的文件、口径、模型登记和森林快照；默认不读、不搜 |
 | [`recycle.sh`](recycle.sh) | 将本项目中的指定文件或目录移入回收站 |
 | [`tests/`](tests/VALIDATION.md) | 少量有意义的闭环与边界验证 |
@@ -49,6 +49,8 @@ bash campaign/run.sh --version v20261029.002 \
 ## 环境与依赖
 
 主 Python 默认 `/mnt/vepfs/Djinhan/conda_env/steel/bin/python`，可通过 `STEEL_HF_PYTHON` 覆盖；外部服务使用 `requests[socks]`。新研究控制器与森林管理独立实现。`scenarios/tools.py` 是唯一物性接点，复用工作区中的模型代码、权重和专用运行环境，具体路径与限制见场景说明。将本目录复制到另一台机器时，还需配置这些物性资产。
+
+真实 LLM 和文献服务的变量模板见 [`.env.example`](.env.example)，复制成 `.env` 后填入自己的地址、模型名和凭据，并按 [调试步骤](campaign/README.md#配置真实服务)加载。`.env` 不自动加载，也不会提交到 Git。
 
 ## Git 管理
 

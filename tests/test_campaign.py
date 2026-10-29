@@ -150,10 +150,13 @@ class CampaignTests(unittest.TestCase):
     def run_research(self, config=None, *, stub_type=ResearchServices, initial_state=None, **options):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        root = Path(self.temporary.name)
         config = config or fixture_config()
+        project = Path(self.temporary.name)
+        root = project / 'outputs' / config['version']
+        root.mkdir(parents=True)
+        engine.save(root / 'input.json', config)
         services_stub = stub_type(config, **options)
-        canonical = root / "forest" / "canonical.json"
+        canonical = project / "forest" / "canonical.json"
         with patch.object(store, "CANONICAL", canonical):
             result = engine.run(config, root, ask=services_stub.ask,
                 literature=services_stub.literature, evaluate=services_stub.evaluate,
@@ -173,8 +176,18 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(all(row["scientific_result"] is False for row in state["evidence"].values()))
         self.assertTrue(all(row["physical_measurement"] is False for row in state["evidence"].values()))
         self.assertTrue((root / "round_01" / "literature.json").is_file())
-        entry.write_report(root, config, result)
-        self.assertIn("frozen_pending_measurement", (root / "候选报告.md").read_text())
+        report = entry.write_report(root, config, result)
+        self.assertEqual(report, root.parent / 'reports' / config['version'] / '候选报告.md')
+        self.assertFalse((root / '候选报告.md').exists())
+        self.assertIn("frozen_pending_measurement", report.read_text())
+        for name in ('input.json', 'result.json'):
+            link = f'../../{config["version"]}/{name}'
+            self.assertIn(f']({link})', report.read_text())
+            self.assertTrue((report.parent / link).is_file())
+        original = report.read_bytes()
+        with self.assertRaises(FileExistsError):
+            entry.write_report(root, config, result)
+        self.assertEqual(report.read_bytes(), original)
 
     def test_rejected_hypothesis_never_reaches_candidate_models(self):
         result, stub, _, canonical = self.run_research(admit=False)
@@ -270,8 +283,8 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(state["nodes"]["v20261029.001-R02-H01"]["evidence_ids"], ["v20261029.001-R01-L01"])
         literature_ids = [row["id"] for row in result["delta"]["evidence"] if row["kind"] == "literature"]
         self.assertEqual(literature_ids, ["v20261029.001-R01-L01"])
-        entry.write_report(root, config, result)
-        self.assertIn("v20261029.001-R01-L01", (root / "候选报告.md").read_text())
+        report = entry.write_report(root, config, result)
+        self.assertIn("v20261029.001-R01-L01", report.read_text())
 
         class UnknownEvidence(EarlierEvidence):
             def ask(self, system, payload):
@@ -315,6 +328,11 @@ class CampaignTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     entry.main(argv)
                 self.assertEqual((root / "outputs/v20261029.001/input.json").read_bytes(), original)
+                (root / 'outputs/reports/v20261029.002').mkdir(parents=True)
+                report_only = [value if value != 'v20261029.001' else 'v20261029.002' for value in argv]
+                with self.assertRaises(FileExistsError):
+                    entry.main(report_only)
+                self.assertFalse((root / 'outputs/v20261029.002').exists())
             execute.assert_not_called()
             read_forest.assert_not_called()
             external.assert_not_called()
