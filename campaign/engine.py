@@ -374,19 +374,37 @@ def plan_searches(call, research, context, limit):
 
 
 def retrieve_literature(queries, literature, usage, folder, prefix):
-    """逐条分配 ID 并保存文献；后续请求失败也保留已取得的结果。"""
-    sources = []
+    """逐条保存真实文献，逐次记录请求；检索缺口另行传给研究阶段。"""
+    sources, requests = [], []
     save(folder / 'literature.json', sources)
+    save(folder / 'literature_requests.json', requests)
+    usage.setdefault('literature_requests', 0)
     for index, query in enumerate(queries, 1):
         usage['literature_queries'] += 1
         save(folder.parent / 'usage.json', usage)
+
+        def record_request(event):
+            record = {'query_index': index, 'query': query, **event}
+            if event['status'] == 'running':
+                requests.append(record)
+                usage['literature_requests'] += 1
+                save(folder.parent / 'usage.json', usage)
+            else:
+                requests[-1] = record
+            save(folder / 'literature_requests.json', requests)
+
         try:
-            for source in literature(query):
+            for source in literature(query, on_event=record_request):
                 sources.append({**source, 'id': f'{prefix}-L{len(sources) + 1:02}'})
                 save(folder / 'literature.json', sources)
         except services.ServiceError as error:
             raise services.ServiceError(f'第 {index} 个文献查询失败：{error}') from None
-    return sources
+    failures = [fields(row, 'query_index query provider error') for row in requests if row['status'] == 'failed']
+    succeeded = sum(row['status'] == 'succeeded' for row in requests)
+    status = ('skipped' if not queries else 'complete' if not failures
+              else 'partial' if succeeded else 'unavailable')
+    return sources, {'status': status, 'queries': len(queries), 'requests': len(requests),
+                     'successful_requests': succeeded, 'records': len(sources), 'failures': failures}
 
 
 def propose_hypotheses(call, research, context, sources, config, prefix):
@@ -439,9 +457,9 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
     base_revision = state['revision']
     instructions, total = prompts(), {'nodes': [], 'evidence': [], 'links': []}
     feedback, usage, nominations = {}, {'llm_calls': 0, 'candidate_evaluations': 0,
-                                      'model_evaluations': 0, 'literature_queries': 0}, []
+                                      'model_evaluations': 0, 'literature_queries': 0, 'literature_requests': 0}, []
     status, checks = 'budget_exhausted', {'accepted': False, 'reasons': ['尚未交付']}
-    rounds, search_history, cache = [], [], {}
+    rounds, search_history, cache, retrievals = [], [], {}, []
     try:
         for index in range(1, config['rounds'] + 1):
             if usage['llm_calls'] >= config['llm_calls']:
@@ -450,7 +468,8 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
             folder.mkdir()
             prefix = f'{config["version"]}-R{index:02}'
             context = store.context(config['scenario']['id'], limit=4, state=state)
-            task = {'question': config['question'], 'requested_candidates': config['recommendations'], 'feedback': feedback}
+            task = {'question': config['question'], 'requested_candidates': config['recommendations'],
+                    'feedback': feedback, 'literature_retrieval': retrievals}
             research = research_context(config)
 
             def call(stage, extra):
@@ -465,7 +484,8 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
                 return answer
 
             queries = plan_searches(call, research, context, config['literature_queries'])
-            sources = retrieve_literature(queries, literature, usage, folder, prefix)
+            sources, retrieval = retrieve_literature(queries, literature, usage, folder, prefix)
+            retrievals.append({'round': index, **retrieval})
             proposal = propose_hypotheses(call, research, context, sources, config, prefix)
             admission = review_hypotheses(call, research, proposal, context)
             inherited_evidence = {eid for node in proposal['nodes'] for eid in node.get('evidence_ids', [])
@@ -513,7 +533,7 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
     save(output / 'forest_delta.json', total)
     save(output / 'forest_review.json', review)
     result = {'version': config['version'], 'status': status, 'base_revision': base_revision,
-              'usage': usage, 'rounds': rounds, 'nominations': nominations,
+              'usage': usage, 'rounds': rounds, 'nominations': nominations, 'literature_retrieval': retrievals,
               'recommended_candidate_ids': checks.get('candidate_ids', []) if status == 'frozen_pending_measurement' else [],
               'delivery': checks, 'delta': total}
     save(output / 'usage.json', usage)

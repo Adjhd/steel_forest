@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
+import warnings
 from collections.abc import Iterator
 
 import requests
@@ -11,6 +13,10 @@ import requests
 
 class ServiceError(RuntimeError):
     """配置缺失或远端调用失败；错误信息不包含密钥和响应正文。"""
+
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _required(name: str) -> str:
@@ -34,9 +40,11 @@ def _post(url: str, key: str, payload: dict, *, service: str, timeout: float, pr
         response.raise_for_status()
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
-        raise ServiceError(f"{service} 返回 HTTP {status}") from None
+        raise ServiceError(f"{service} 返回 HTTP {status}",
+                           retryable=status in (429, 500, 502, 503, 504)) from None
     except requests.RequestException as exc:
-        raise ServiceError(f"{service} 网络请求失败：{type(exc).__name__}") from None
+        transient = isinstance(exc, (requests.Timeout, requests.ConnectionError)) and not isinstance(exc, requests.exceptions.SSLError)
+        raise ServiceError(f"{service} 网络请求失败：{type(exc).__name__}", retryable=transient) from None
     try:
         body = response.json()
     except ValueError:
@@ -154,12 +162,15 @@ def _dprag(query: str, top_k: int) -> list[dict]:
     return records
 
 
-def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> Iterator[dict]:
-    """服务依次请求、结果逐条返回，调用方可在下一服务请求前保存。"""
+def literature(query: str, *, provider: str = "auto", top_k: int = 8,
+               max_attempts: int = 3, on_event=None) -> Iterator[dict]:
+    """文献临时故障有限重试，耗尽后继续；请求事件与真实文献分别返回。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("文献查询不能为空")
     if type(top_k) is not int or top_k < 1:
         raise ValueError("top_k 必须是正整数；服务自身的数量限制由服务端处理")
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts 必须是正整数")
     providers = {"lkm": ("BOHR_ACCESS_KEY", _lkm), "dprag": ("DPRAG_API_KEY", _dprag)}
     if provider == "auto":
         selected = [name for name, (credential, _) in providers.items() if os.getenv(credential, "").strip()]
@@ -170,5 +181,29 @@ def literature(query: str, *, provider: str = "auto", top_k: int = 8) -> Iterato
     else:
         raise ValueError("文献 provider 必须是 auto、lkm 或 dprag")
     for name in selected:
-        for record in providers[name][1](query.strip(), top_k):
-            yield {**record, "query": query.strip()}
+        _required(providers[name][0])
+
+        def notify(status, **details):
+            event = {"provider": name, "attempt": attempt, "status": status, **details}
+            if on_event is not None:
+                on_event(event)
+            elif status in ("retrying", "failed"):
+                warnings.warn(f'{name.upper()} 第 {attempt} 次请求 {status}：{details["error"]}', RuntimeWarning)
+
+        for attempt in range(1, max_attempts + 1):
+            notify("running")
+            try:
+                records = providers[name][1](query.strip(), top_k)
+            except ServiceError as error:
+                retry = error.retryable and attempt < max_attempts
+                notify("retrying" if retry else "failed", error=str(error), retryable=error.retryable)
+                if not error.retryable:
+                    raise
+                if retry:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            notify("succeeded", records=len(records))
+            for record in records:
+                yield {**record, "query": query.strip()}
+            break
