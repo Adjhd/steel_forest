@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -13,6 +14,75 @@ from campaign import search, services
 
 class BudgetExhausted(Exception):
     """LLM 预算用完；结束本批并保存已经完成的阶段。"""
+
+
+class StageFailed(Exception):
+    """有限重试与纠正后，本阶段仍没有可用结果。"""
+
+
+def request_stage(stage, payload, instruction, ask, usage, output, folder, limit,
+                  check=None, reserve=0):
+    """一次阶段最多请求三次；预算按请求计，纠正失败仍保留已获得的有效记录。"""
+    output, folder = Path(output), Path(folder)
+    log_path = folder / 'llm_requests.json'
+    requests = json.loads(log_path.read_text()) if log_path.exists() else []
+    save(folder / f'{stage}_input.json', payload)
+    request, retained, retained_answer, retained_attempt = payload, None, None, None
+    for attempt in range(1, 4):
+        event = {'stage': stage, 'attempt': attempt, 'status': 'running'}
+        requests.append(event)
+        if usage['llm_calls'] >= limit - reserve:
+            event['status'] = 'budget_exhausted'
+            save(log_path, requests)
+            break
+        usage['llm_calls'] += 1
+        event['call'] = usage['llm_calls']
+        save(output / 'usage.json', usage)
+        save(folder / f'{stage}_input.json', request)
+        save(log_path, requests)
+        transient = False
+        try:
+            answer = ask(instruction, request)
+        except services.ServiceError as exc:
+            event['errors'] = [str(exc)]
+            if isinstance(exc, services.LLMOutputError):
+                event['status'] = 'invalid_output'
+                request = {**payload, 'correction': {'issues': [str(exc)]}}
+            elif exc.retryable:
+                event['status'] = 'service_error'
+                transient = True
+            else:
+                event['status'] = 'failed'
+                save(log_path, requests)
+                raise
+        else:
+            save(folder / f'{stage}.json', answer)
+            try:
+                value, issues = check(answer) if check else (answer, [])
+            except (ValueError, KeyError, TypeError) as exc:
+                value, issues = None, [str(exc)]
+            if value is None and not issues:
+                issues = ['本阶段没有可用结果']
+            if value is not None:
+                retained, retained_answer, retained_attempt = value, answer, attempt
+            event['status'] = 'accepted' if not issues else 'invalid_records'
+            if issues:
+                event['errors'] = issues
+                request = {**payload, 'correction': {'issues': issues, 'previous_answer': answer}}
+            save(log_path, requests)
+            if not issues:
+                return value
+        save(log_path, requests)
+        if transient and attempt < 3 and usage['llm_calls'] < limit - reserve:
+            time.sleep(2 ** attempt)
+    if retained is not None:
+        event['retained_attempt'] = retained_attempt
+        save(log_path, requests)
+        save(folder / f'{stage}.json', retained_answer)
+        return retained
+    if usage['llm_calls'] >= limit - reserve:
+        raise BudgetExhausted(stage)
+    raise StageFailed(f'{stage}: {"; ".join(event.get("errors", []))}')
 
 
 def save(path, value):
@@ -47,8 +117,14 @@ def literature_reading(records):
 
 
 def hypothesis_reading(nodes):
-    return [fields(node, 'id revision scenario status statement scope predictions falsifiers unresolved '
-                         'evidence_ids source_hypothesis_ids transfer_contract source_refs') for node in nodes]
+    result = []
+    for node in nodes:
+        card = fields(node, 'id revision scenario status statement scope predictions falsifiers unresolved '
+                            'evidence_ids source_hypothesis_ids transfer_contract source_refs')
+        if not node.get('predictions'):
+            card['verification_plan'] = node.get('verification_plan') or node.get('verification_action')
+        result.append(card)
+    return result
 
 
 def cited_evidence(nodes, records):
@@ -74,7 +150,7 @@ def review_reading(evaluated, previous):
                    for eid in node['evidence_ids']}
         for node in delta['nodes']:
             if node['kind'] == 'candidate':
-                nodes.append(fields(node, 'id kind composition role hypothesis_id hypothesis_version plan_id evidence_ids sampled protocol_case_ids'))
+                nodes.append(fields(node, 'id kind composition role hypothesis_id hypothesis_version plan_id evidence_ids sampled protocol_case_ids evaluation_errors'))
             else:
                 details = {key: value for key, value in node.items()
                            if key not in {'id', 'kind', 'scenario', 'version', 'revision', 'version_id',
@@ -107,33 +183,92 @@ def accepted(delta, review, existing_evidence=()):
             'links': delta.get('links', [])}
 
 
+def review_selection(answer, delta, state):
+    """规范审查选择并保持引用闭合，缺失的依赖交给 LLM 纠正。"""
+    review, issues = deepcopy(answer), []
+    if 'recommended_candidate_ids' in review and (not isinstance(review['recommended_candidate_ids'], list)
+            or any(not isinstance(key, str) for key in review['recommended_candidate_ids'])):
+        raise ValueError('recommended_candidate_ids 必须是 ID 列表')
+    for field, records, existing in (('accepted_node_ids', delta['nodes'], state['nodes']),
+                                     ('accepted_evidence_ids', delta['evidence'], state['evidence'])):
+        if not isinstance(review[field], list):
+            raise ValueError(f'{field} 必须是 ID 列表')
+        known = {record['id'] for record in records}
+        unknown = set(review[field]) - known - existing.keys()
+        if unknown:
+            issues.append(f'{field} 引用了未知 ID：{sorted(unknown)}')
+        review[field] = list(dict.fromkeys(key for key in review[field] if key in known))
+    nodes = {node['id']: node for node in delta['nodes']}
+    evidence = state['evidence'].keys() | set(review['accepted_evidence_ids'])
+    while True:
+        known = state['nodes'].keys() | set(review['accepted_node_ids'])
+        rejected = []
+        for key in review['accepted_node_ids']:
+            node = nodes[key]
+            references = {node[field] for field in ('hypothesis_id', 'plan_id', 'candidate_id') if node.get(field)}
+            references.update(node.get('hypothesis_ids', []))
+            if not references <= known or not set(node.get('evidence_ids', [])) <= evidence:
+                rejected.append(key)
+                issues.append(f'{key} 的计划、假设或证据未接受')
+        if not rejected:
+            break
+        review['accepted_node_ids'] = [key for key in review['accepted_node_ids'] if key not in rejected]
+    store.apply(state, delta, review)
+    return (review if review['accepted_node_ids'] or review['accepted_evidence_ids'] or not issues else None), issues
+
+
 def append_delta(total, addition):
     for name in ('nodes', 'evidence', 'links'):
         total[name].extend(addition[name])
 
 
+def valid_records(records, build):
+    """逐条转换 LLM 记录，坏记录带回纠正，不丢掉同批有效记录。"""
+    if not isinstance(records, list):
+        raise ValueError('记录必须是列表')
+    values, issues = [], []
+    for index, record in enumerate(records, 1):
+        try:
+            values.append(build(deepcopy(record), index))
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            issues.append({'index': index, 'error': str(error)})
+    return values, issues
+
+
+def hypothesis_bounds(node, config):
+    """沿用假设时，设计范围取假设与本批任务的交集。"""
+    bounds = validate_ranges(config['scenario'], node['scope']['composition_ranges_wt_pct'])
+    task = config['space']['composition_ranges_wt_pct']
+    return validate_ranges(config['scenario'], {
+        element: [max(bounds.get(element, [0, 0])[0], task.get(element, [0, 0])[0]),
+                  min(bounds.get(element, [0, 0])[1], task.get(element, [0, 0])[1])]
+        for element in bounds.keys() | task.keys()})
+
+
+def reusable_hypotheses(context, config):
+    candidates = [node for node in context['hypotheses'] if node['scenario'] == config['scenario']['id']]
+    def usable(node, index):
+        hypothesis_bounds(node, config)
+        return node
+    return valid_records(candidates, usable)[0]
+
+
 def make_hypotheses(answer, sources, context, config, prefix):
-    evidence = [{'id': f'{prefix}-L{i:02}', 'kind': 'literature',
+    evidence = [{'id': row['id'], 'kind': 'literature',
                  'source': row.get('url') or row.get('source') or row.get('source_id'),
                  'summary': row.get('text') or row.get('title', ''),
-                 'status': 'lead', 'record': row} for i, row in enumerate(sources, 1)]
-    # ID 在提问前已赋予；这里沿用，保持引用稳定。
-    for item, row in zip(evidence, sources):
-        item['id'] = row['id']
+                 'status': 'lead', 'record': row} for row in sources]
     nodes, links = [], []
-    known_evidence = {e['id'] for e in evidence}
-    inherited = context.get('evidence', [])
-    known_evidence.update(e['id'] for e in (inherited.values() if isinstance(inherited, dict) else inherited))
-    inherited_nodes = context.get('hypotheses', [])
-    inherited_by_id = {n['id']: n for n in (inherited_nodes.values() if isinstance(inherited_nodes, dict) else inherited_nodes)}
-    inherited_ids = inherited_by_id.keys()
-    for index, hypothesis in enumerate(answer['hypotheses'], 1):
+    known_evidence = {e['id'] for e in evidence + context['evidence']}
+    inherited_by_id = {node['id']: node for node in context['hypotheses']}
+
+    def build(hypothesis, index):
         for field in ('statement', 'scope', 'predictions', 'falsifiers', 'unresolved'):
             if not hypothesis.get(field):
                 raise ValueError(f'假设缺少 {field}')
         if not set(hypothesis.get('evidence_ids', [])) <= known_evidence:
             raise ValueError('假设引用了未读取的证据')
-        if not set(hypothesis.get('source_hypothesis_ids', [])) <= inherited_ids:
+        if not set(hypothesis.get('source_hypothesis_ids', [])) <= inherited_by_id.keys():
             raise ValueError('假设引用了未读取的森林节点')
         bounds = validate_ranges(config['scenario'], hypothesis['scope']['composition_ranges_wt_pct'])
         task_bounds = config['space']['composition_ranges_wt_pct']
@@ -147,7 +282,7 @@ def make_hypotheses(answer, sources, context, config, prefix):
                 'scenario': config['scenario']['id'], 'version': 1, 'status': 'proposed',
                 'verification_plan': {'support': hypothesis['predictions'], 'weaken': hypothesis['falsifiers'],
                                       'unresolved': hypothesis['unresolved']}}
-        nodes.append(node)
+        node_links = []
         for source in hypothesis.get('source_hypothesis_ids', []):
             link = {'source': source, 'target': node['id'], 'relation': 'inspired_by'}
             if inherited_by_id[source]['scenario'] != config['scenario']['id']:
@@ -155,8 +290,23 @@ def make_hypotheses(answer, sources, context, config, prefix):
                 if not all(contract.get(key) for key in ('source_conditions', 'target_conditions', 'shared_mechanism', 'verification')):
                     raise ValueError('跨场景启发需要明确条件差异、共同机理及验证方法')
                 link.update(relation='transfer_candidate', transfer_contract=contract)
-            links.append(link)
-    return {'nodes': nodes, 'evidence': evidence, 'links': links}
+            node_links.append(link)
+        return node, node_links
+
+    records, issues = valid_records(answer['hypotheses'], build)
+    for node, node_links in records:
+        nodes.append(node)
+        links.extend(node_links)
+    reusable = {node['id'] for node in reusable_hypotheses(context, config)}
+    def reuse_id(key, index):
+        if key not in reusable:
+            raise ValueError(f'假设 {key} 不在可沿用列表中')
+        return key
+    reuse, errors = valid_records(answer.get('reuse_hypothesis_ids', []), reuse_id)
+    issues.extend(errors)
+    proposal = {'nodes': nodes, 'evidence': cited_evidence(nodes, evidence), 'links': links,
+                'reuse_hypothesis_ids': list(dict.fromkeys(reuse))}
+    return (proposal if nodes or reuse or not issues else None), issues
 
 
 def validate_plan(plan):
@@ -174,7 +324,7 @@ def search_spaces(designs, hypotheses, config):
     spaces, templates = [], {}
     for index, design in enumerate(designs[:config['evaluations']], 1):
         if design['hypothesis_id'] not in ids:
-            raise ValueError('候选必须绑定本轮已准入假设')
+            raise ValueError('候选必须绑定已准入或本轮选用的已有假设')
         if design['role'] not in ('target', 'control', 'discrimination_probe'):
             raise ValueError('候选角色必须是 target/control/discrimination_probe')
         if design['role'] == 'discrimination_probe':
@@ -182,8 +332,10 @@ def search_spaces(designs, hypotheses, config):
             if len(set(competitors)) < 2 or not set(competitors) <= ids.keys() or not design['plan'].get('contrasting_predictions'):
                 raise ValueError('区分探针需要至少两个已准入竞争假设及不同预测')
         validate_plan(design['plan'])
-        bounds = ids[design['hypothesis_id']]['scope']['composition_ranges_wt_pct']
-        item = {**design, 'composition': complete_composition(scenario, design['composition'], bounds)}
+        hypothesis = ids[design['hypothesis_id']]
+        bounds = hypothesis_bounds(hypothesis, config)
+        item = {**design, 'hypothesis_version': hypothesis.get('revision', 1),
+                'composition': complete_composition(scenario, design['composition'], bounds)}
         region = {e: [value, value] for e, value in item['composition'].items()}
         if design.get('search_ranges_wt_pct'):
             varied = set(design['plan'].get('vary_elements', []))
@@ -218,13 +370,33 @@ def search_objectives(config):
             and metric.get('ranking', {}).get('allowed', True)]
 
 
-def evaluate_candidate(design, composition, config, folder, prefix, index, evaluate, usage, cache):
-    """一个实际成分对应多条条件证据；完全相同的本批调用可引用已有结果。"""
+def evaluate_candidate(design, composition, config, folder, prefix, index, evaluate, usage, cache,
+                       on_progress=None):
+    """逐条件保存真实证据；单次预测失败只留下缺口，不中断其他条件。"""
+    from scenarios.tools import PredictionError
+
     cid, pid = (f'{prefix}-{kind}{index:03}' for kind in ('C', 'P'))
     evidence, values = [], {}
     cases = config['space']['protocol_cases']
+    common = {'scenario': config['scenario']['id'], 'version': 1, 'status': 'proposed'}
+    candidate = {**common, 'id': cid, 'kind': 'candidate', 'statement': design['plan']['question'],
+                 'composition': composition, 'role': design['role'], 'hypothesis_id': design['hypothesis_id'],
+                 'hypothesis_version': design.get('hypothesis_version', 1), 'plan_id': pid, 'evidence_ids': [],
+                 'sampled': composition != design['composition'], 'protocol_case_ids': list(cases),
+                 'evaluation_errors': []}
+    plan = {**design['plan'], **common, 'id': pid, 'kind': 'experiment_plan',
+            'statement': design['plan']['question'], 'candidate_id': cid, 'protocol_case_ids': list(cases)}
+    delta = {'nodes': [candidate, plan], 'evidence': evidence,
+             'links': [{'source': design['hypothesis_id'], 'target': cid, 'relation': 'tested_by'},
+                       {'source': cid, 'target': pid, 'relation': 'planned_by'}]}
+
+    def checkpoint():
+        if on_progress:
+            on_progress(delta)
+
     usage['candidate_evaluations'] += 1
     save(folder.parent / 'usage.json', usage)
+    checkpoint()
     versions = {tool['id']: tool['version'] for tool in config['scenario']['tools']}
     for case_index, (name, case) in enumerate(cases.items(), 1):
         eid = f'{prefix}-M{index:03}-K{case_index:02}'
@@ -235,8 +407,20 @@ def evaluate_candidate(design, composition, config, folder, prefix, index, evalu
         else:
             usage['model_evaluations'] += 1
             save(folder.parent / 'usage.json', usage)
-            result = evaluate(config['scenario'], composition, case['protocol'], folder / cid / f'case_{case_index:02}',
-                              tool_ids=case['tools'])
+            workdir = folder / cid / f'case_{case_index:02}'
+            try:
+                result = evaluate(config['scenario'], composition, case['protocol'], workdir, tool_ids=case['tools'])
+            except Exception as exc:
+                fatal = not isinstance(exc, (PredictionError, TimeoutError, ArithmeticError))
+                error = {'protocol_case_id': name, 'tools': case['tools'], 'error': str(exc),
+                         'error_type': type(exc).__name__, 'fatal': fatal}
+                candidate['evaluation_errors'].append(error)
+                workdir.mkdir(parents=True, exist_ok=True)
+                save(workdir / 'error.json', error)
+                checkpoint()
+                if fatal:
+                    raise
+                continue
             record = {**result, 'kind': 'model', 'status': 'diagnostic',
                       'source': json.dumps(result['tools'], ensure_ascii=False),
                       'summary': '模型预测；不是实测，也不证明机理成立。',
@@ -244,20 +428,12 @@ def evaluate_candidate(design, composition, config, folder, prefix, index, evalu
         record.update(id=eid, protocol_case_id=name)
         cache.setdefault(key, deepcopy(record))
         evidence.append(record)
+        candidate['evidence_ids'].append(eid)
         for metric, value in record['metrics'].items():
             value = value.get('value') if isinstance(value, dict) else value
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
                 values[f'{name}/{metric}'] = value
-    common = {'scenario': config['scenario']['id'], 'version': 1, 'status': 'proposed'}
-    candidate = {**common, 'id': cid, 'kind': 'candidate', 'statement': design['plan']['question'],
-                 'composition': composition, 'role': design['role'], 'hypothesis_id': design['hypothesis_id'],
-                 'hypothesis_version': 1, 'plan_id': pid, 'evidence_ids': [e['id'] for e in evidence],
-                 'sampled': composition != design['composition'], 'protocol_case_ids': list(cases)}
-    plan = {**design['plan'], **common, 'id': pid, 'kind': 'experiment_plan',
-            'statement': design['plan']['question'], 'candidate_id': cid, 'protocol_case_ids': list(cases)}
-    delta = {'nodes': [candidate, plan], 'evidence': evidence,
-             'links': [{'source': design['hypothesis_id'], 'target': cid, 'relation': 'tested_by'},
-                       {'source': cid, 'target': pid, 'relation': 'planned_by'}]}
+        checkpoint()
     return delta, {'id': cid, 'metrics': values}
 
 
@@ -269,6 +445,9 @@ def search_candidates(designs, hypotheses, config, folder, prefix, evaluate, usa
     delta = {'nodes': [], 'evidence': [], 'links': []}
     count = 0
 
+    def checkpoint(addition):
+        save(folder / 'evaluated.json', {key: delta[key] + addition[key] for key in delta})
+
     def predict(space_id, composition):
         nonlocal count
         if count >= config['evaluations']:
@@ -276,9 +455,8 @@ def search_candidates(designs, hypotheses, config, folder, prefix, evaluate, usa
         composition = complete_composition(config['scenario'], composition, bounds[space_id])
         count += 1
         addition, observation = evaluate_candidate(templates[space_id], composition, config, folder, prefix,
-                                                  count, evaluate, usage, cache)
+                                                  count, evaluate, usage, cache, on_progress=checkpoint)
         append_delta(delta, addition)
-        save(folder / 'evaluated.json', delta)
         return observation
 
     options = {'seed': round_index, **config['space'].get('search', {})}
@@ -293,24 +471,21 @@ def delivery(review, delta, config):
     selected = review.get('recommended_candidate_ids', [])
     nodes, evidence = {n['id']: n for n in delta['nodes']}, {e['id']: e for e in delta['evidence']}
     scenario, cases = config['scenario'], config['space']['protocol_cases']
-    reasons = []
-    recipes = {tuple(sorted((e, v) for e, v in nodes[cid]['composition'].items() if v)) for cid in selected
-               if cid in nodes and nodes[cid].get('kind') == 'candidate'}
-    if len(recipes) < config['recommendations']:
-        reasons.append(f'需要至少 {config["recommendations"]} 个不同成分的候选，当前 {len(recipes)} 个')
+    qualified, rejected, recipes = [], {}, set()
     screening = [m for m in scenario['metrics'] if m['role'] == 'screening' and m.get('target') is not None]
     available = {key for case in cases.values() for key in case['metrics']}
-    missing = {m['key'] for m in screening} - available
-    if missing:
-        reasons.append(f'本批工具组合未覆盖名义筛选指标 {sorted(missing)}')
-    for candidate_id in selected:
+    uncovered = {m['key'] for m in screening} - available
+    for candidate_id in dict.fromkeys(selected):
+        reasons = [f'本批工具组合未覆盖名义筛选指标 {sorted(uncovered)}'] if uncovered else []
         candidate = nodes.get(candidate_id, {})
         plan = nodes.get(candidate.get('plan_id'))
         if candidate.get('kind') != 'candidate' or plan is None:
             reasons.append(f'{candidate_id}: 候选或计划未接受')
+            rejected[candidate_id] = reasons
             continue
         if not candidate.get('evidence_ids') or not set(candidate['evidence_ids']) <= set(evidence):
             reasons.append(f'{candidate_id}: 预测证据未接受')
+            rejected[candidate_id] = reasons
             continue
         required = {m['key'] for m in scenario['metrics'] if m.get('target') is not None}
         missing = required - set(plan['measurements'])
@@ -334,7 +509,19 @@ def delivery(review, delta, config):
                            '<=': lambda: value <= target, '<': lambda: value < target}[op]()
                 if not passed:
                     reasons.append(f'{candidate_id}/{name}: {spec["key"]} 未满足名义筛选')
-    return {'accepted': not reasons, 'reasons': reasons, 'candidate_ids': selected if not reasons else []}
+        if reasons:
+            rejected[candidate_id] = reasons
+        else:
+            recipe = tuple(sorted((element, value) for element, value in candidate['composition'].items() if value))
+            if recipe not in recipes:
+                qualified.append(candidate_id)
+                recipes.add(recipe)
+    shortfall = max(0, config['recommendations'] - len(qualified))
+    reasons = [reason for failures in rejected.values() for reason in failures]
+    if shortfall:
+        reasons.insert(0, f'需要至少 {config["recommendations"]} 个不同成分的候选，已合格 {len(qualified)} 个，还缺 {shortfall} 个')
+    return {'accepted': not shortfall, 'reasons': reasons, 'candidate_ids': qualified,
+            'shortfall': shortfall, 'rejected': rejected}
 
 
 def candidate_pool(delta):
@@ -368,9 +555,15 @@ def plan_searches(call, research, context, limit):
                 'transfer_contract': fields(link.get('transfer_contract', {}),
                                             'shared_mechanism source_conditions target_conditions')}
                for link in context['links']]
-    answer = call('queries', {**research, 'forest': {'hypotheses': questions, 'links': bridges},
-                             'query_limit': limit})
-    return answer['queries'][:limit]
+    def check(answer):
+        def query(text, index):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError('文献查询必须是非空文本')
+            return text.strip()
+        queries, issues = valid_records(answer['queries'], query)
+        return (queries if queries or not issues else None), issues
+    return call('queries', {**research, 'forest': {'hypotheses': questions, 'links': bridges},
+                           'query_limit': limit}, check=check)[:limit]
 
 
 def retrieve_literature(queries, literature, usage, folder, prefix):
@@ -411,13 +604,12 @@ def propose_hypotheses(call, research, context, sources, config, prefix):
     """结合森林与文献提出假设，只把被引用的新证据纳入提案。"""
     reading = {'hypotheses': context['hypotheses'], 'links': context['links'],
                'evidence': literature_reading(context['evidence'])}
-    answer = call('hypotheses', {**research, 'forest': reading, 'sources': literature_reading(sources)})
-    proposal = make_hypotheses(answer, sources, context, config, prefix)
-    proposal['evidence'] = cited_evidence(proposal['nodes'], proposal['evidence'])
-    return proposal
+    return call('hypotheses', {**research, 'forest': reading, 'sources': literature_reading(sources),
+        'reusable_hypothesis_ids': [node['id'] for node in reusable_hypotheses(context, config)]},
+        check=lambda answer: make_hypotheses(answer, sources, context, config, prefix))
 
 
-def review_hypotheses(call, research, proposal, context):
+def review_hypotheses(call, research, proposal, context, state):
     """审查提议假设及其新旧依据，返回准入决定。"""
     source_ids = {sid for node in proposal['nodes'] for sid in node.get('source_hypothesis_ids', [])}
     source_hypotheses = [node for node in context['hypotheses'] if node['id'] in source_ids]
@@ -426,27 +618,34 @@ def review_hypotheses(call, research, proposal, context):
                      'evidence': literature_reading(proposal['evidence'])},
         'forest': {'hypotheses': source_hypotheses,
                    'evidence': literature_reading(cited_evidence(proposal['nodes'] + source_hypotheses,
-                                                                context['evidence']))}})
+                                                                context['evidence']))}},
+        check=lambda answer: review_selection(answer, proposal, state))
 
 
 def design_candidates(call, research, hypotheses, evidence, config):
     """提出明确设计、对照和允许探索的范围，数值搜索单独执行。"""
-    answer = call('design', {**research, 'hypotheses': hypothesis_reading(hypotheses),
+    def check(answer):
+        def design(record, index):
+            search_spaces([record], hypotheses, config)
+            return record
+        designs, issues = valid_records(answer['designs'], design)
+        return (designs if designs or not issues else None), issues
+    return call('design', {**research, 'hypotheses': hypothesis_reading(hypotheses),
         'literature': literature_reading(cited_evidence(hypotheses, evidence)),
         'tools': [{key: value for key, value in tool.items() if key not in {'asset', 'kind'}}
                   for tool in config['scenario']['tools']],
-        'evaluations': config['evaluations']})
-    return answer['designs']
+        'evaluations': config['evaluations']}, check=check, reserve=0 if config.get('allow_unreviewed') else 1)
 
 
-def review_candidates(call, research, hypotheses, evidence, evaluated, previous_pool, search_result):
+def review_candidates(call, research, hypotheses, evidence, evaluated, previous_pool, search_result, state):
     """结合文献与真实预测，复审本轮结果及本批此前接受的候选。"""
     return call('review', {'scenario': research['scenario'],
         'protocol_cases': research['space']['protocol_cases'],
         'search': {'recommendations': search_result['recommendations'], 'trace': search_result['trace']},
         'hypotheses': hypothesis_reading(hypotheses),
         'literature': literature_reading(cited_evidence(hypotheses, evidence)),
-        **review_reading(evaluated, previous_pool)})
+        **review_reading(evaluated, previous_pool)},
+        check=lambda answer: review_selection(answer, evaluated, state))
 
 
 def run(config, output, *, ask=services.ask, literature=services.literature,
@@ -467,50 +666,46 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
             folder = output / f'round_{index:02}'
             folder.mkdir()
             prefix = f'{config["version"]}-R{index:02}'
-            context = store.context(config['scenario']['id'], limit=4, state=state)
+            context = store.context(config['scenario']['id'], state=state, question=config['question'])
             task = {'question': config['question'], 'requested_candidates': config['recommendations'],
                     'feedback': feedback, 'literature_retrieval': retrievals}
             research = research_context(config)
 
-            def call(stage, extra):
-                if usage['llm_calls'] >= config['llm_calls']:
-                    raise BudgetExhausted(stage)
-                payload = {**task, **extra}
-                save(folder / f'{stage}_input.json', payload)
-                usage['llm_calls'] += 1
-                save(output / 'usage.json', usage)
-                answer = ask(instructions[stage], payload)
-                save(folder / f'{stage}.json', answer)
-                return answer
+            def call(stage, extra, check=None, reserve=0):
+                return request_stage(stage, {**task, **extra}, instructions[stage], ask, usage,
+                                     output, folder, config['llm_calls'], check, reserve)
 
             queries = plan_searches(call, research, context, config['literature_queries'])
             sources, retrieval = retrieve_literature(queries, literature, usage, folder, prefix)
             retrievals.append({'round': index, **retrieval})
             proposal = propose_hypotheses(call, research, context, sources, config, prefix)
-            admission = review_hypotheses(call, research, proposal, context)
-            inherited_evidence = {eid for node in proposal['nodes'] for eid in node.get('evidence_ids', [])
-                                  if eid in state['evidence']}
-            admitted = accepted(proposal, admission, inherited_evidence)
-            state = store.apply(state, proposal, {**admission,
-                                'accepted_evidence_ids': [e['id'] for e in admitted['evidence']]})
-            append_delta(total, admitted)
-            if not admitted['nodes']:
-                feedback = {'reason': admission['reason'], 'next_question': '修正假设与证据'}
+            active_ids = set(proposal['reuse_hypothesis_ids'])
+            if proposal['nodes']:
+                admission = review_hypotheses(call, research, proposal, context, state)
+                admitted = accepted(proposal, admission)
+                state = store.apply(state, proposal, admission)
+                append_delta(total, admitted)
+                active_ids.update(node['id'] for node in admitted['nodes'])
+            hypotheses = [node for key, node in state['nodes'].items() if key in active_ids]
+            if not hypotheses:
+                feedback = {'reason': '没有选用已有假设或准入新假设', 'next_question': '修正假设与证据'}
                 rounds.append({'round': index, 'status': 'hypotheses_rejected'})
                 continue
             if not config['evaluations']:
-                feedback = {'reason': admission['reason'], 'next_question': '继续研究假设与证据'}
+                feedback = {'reason': '已选择研究假设', 'next_question': '继续研究假设与证据'}
                 rounds.append({'round': index, 'status': 'hypotheses_only'})
                 continue
-            designs = design_candidates(call, research, admitted['nodes'], state['evidence'].values(), config)
-            evaluated, search_result = search_candidates(designs, admitted['nodes'], config, folder, prefix,
+            designs = design_candidates(call, research, hypotheses, state['evidence'].values(), config)
+            if not config.get('allow_unreviewed') and config['llm_calls'] - usage['llm_calls'] < 1:
+                raise BudgetExhausted('预测前需留有一次复审请求预算')
+            evaluated, search_result = search_candidates(designs, hypotheses, config, folder, prefix,
                 evaluate, usage, cache, search_history, index, searcher)
             search_history.extend(search_result['observations'])
             previous_pool = candidate_pool(total)
             prior_ids = {n['hypothesis_id'] for n in previous_pool['nodes'] if n['kind'] == 'candidate'}
-            hypotheses = [n for n in total['nodes'] if n['id'] in prior_ids or n in admitted['nodes']]
+            hypotheses = [n for key, n in state['nodes'].items() if key in prior_ids | active_ids]
             review = review_candidates(call, research, hypotheses, state['evidence'].values(),
-                                       evaluated, previous_pool, search_result)
+                                       evaluated, previous_pool, search_result, state)
             approved = accepted(evaluated, review)
             state = store.apply(state, evaluated, review)
             append_delta(total, approved)
@@ -526,16 +721,23 @@ def run(config, output, *, ask=services.ask, literature=services.literature,
                 break
     except BudgetExhausted as stage:
         rounds.append({'round': index, 'status': 'budget_exhausted', 'next_stage': str(stage)})
+    except StageFailed as stage:
+        status = 'llm_stage_failed'
+        rounds.append({'round': index, 'status': status, 'stage': str(stage)})
     save(output / 'progress.json', {'usage': usage, 'rounds': rounds})
     review = {'accepted_node_ids': [n['id'] for n in total['nodes']],
               'accepted_evidence_ids': [e['id'] for e in total['evidence']],
               'reason': '各轮科学准入与研究审查的已接受记录', 'reviewer': 'campaign_scientific_review'}
     save(output / 'forest_delta.json', total)
     save(output / 'forest_review.json', review)
+    hypothesis_ids = {n['hypothesis_id'] for n in total['nodes'] if n['kind'] == 'candidate'}
+    hypotheses = [node for key, node in state['nodes'].items() if key in hypothesis_ids]
     result = {'version': config['version'], 'status': status, 'base_revision': base_revision,
               'usage': usage, 'rounds': rounds, 'nominations': nominations, 'literature_retrieval': retrievals,
-              'recommended_candidate_ids': checks.get('candidate_ids', []) if status == 'frozen_pending_measurement' else [],
-              'delivery': checks, 'delta': total}
+              'recommended_candidate_ids': checks.get('candidate_ids', []),
+              'delivery': checks, 'delta': total,
+              'hypotheses': hypotheses,
+              'hypothesis_evidence': cited_evidence(hypotheses, state['evidence'].values())}
     save(output / 'usage.json', usage)
     save(output / 'result.json', result)
     if config.get('merge') and total['nodes']:

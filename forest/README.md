@@ -12,11 +12,14 @@
 from forest.store import load, context
 
 state = load()
-reading = context("weak_field_nonmagnetic_plate", state=state)
+reading = context("weak_field_nonmagnetic_plate", state=state,
+                  question="研究 Mn、N 对低磁性与强塑性的影响")
 hypothesis = state["nodes"]["某个节点ID"]
 ```
 
-`context` 默认返回最多 12 张假设卡片，保留完整作用域、预测、证伪条件和关联证据；缺少预测的卡片另带验证计划。跨场景内容沿明确的 `transfer_candidate` 关系读取，保留共同机理、条件差异、验证方法与风险，省略重复登记字段。`source_refs` 中已有的摘录和来源定位会随卡片提供，它们仍是来源线索，不会自动变成已核验的证据或新增 `evidence_ids`。完整科学字段可按节点 ID 从当前森林读取。
+`context` 按研究问题与假设科学字段的词语重合排序：匹配英文词、元素符号和中文双字片段，相关性相同时优先本场景，再考虑更新时间。默认最多 12 张卡片，调用方可通过 `limit` 调整；不提供 `question` 时优先读取本场景近期假设。它是透明的文字检索，不等同于语义理解。
+
+卡片保留完整作用域、预测、证伪条件和关联证据；缺少预测的卡片另带验证计划。跨场景假设只沿带有迁移条件的明确 `transfer_candidate` 关系读取，选入时同时保留本场景的关联假设，不预留固定比例。关系保留共同机理、条件差异、验证方法与风险，省略重复登记字段。`source_refs` 中已有的摘录和来源定位会随卡片提供，它们仍是来源线索，不会自动变成已核验的证据或新增 `evidence_ids`。完整科学字段可按节点 ID 从当前森林读取。
 
 `load(path=None)` 返回普通字典：`nodes`、`evidence` 按 ID 索引，`links`、`campaigns` 是列表，`revision` 是森林版本号。默认路径就是本目录的 `canonical.json`。
 

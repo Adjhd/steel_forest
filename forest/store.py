@@ -5,6 +5,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,8 +51,16 @@ def _context_source(reference):
     return {"quote": reference["quote"], "source_location": location}
 
 
-def context(scenario, limit=12, state=None) -> dict:
-    """Read hypothesis conditions, linked evidence and bridges without candidates."""
+def _terms(text):
+    """Match Latin words/elements and overlapping Chinese pairs without a tokenizer."""
+    terms = set(re.findall(r"[a-z][a-z0-9]*", text.lower()))
+    for phrase in re.findall(r"[\u4e00-\u9fff]+", text):
+        terms.update(phrase[index:index + 2] for index in range(max(1, len(phrase) - 1)))
+    return terms
+
+
+def context(scenario, limit=12, state=None, question="") -> dict:
+    """Read question-relevant hypotheses and explicit bridges without candidates."""
     state = load() if state is None else state
     if limit < 1:
         raise ValueError("Context limit must be positive")
@@ -59,22 +68,35 @@ def context(scenario, limit=12, state=None) -> dict:
                   if node["kind"] == "hypothesis"
                   and node.get("status") not in {"retired", "superseded"}}
     direct = [node for node in hypotheses.values() if node.get("scenario") == scenario]
-    direct.sort(key=lambda node: (node.get("updated_at", ""), node.get("revision", 1)), reverse=True)
-    # Reserve a third of the reading budget for explicit source-to-target bridges.
-    chosen = {node["id"]: node for node in direct[:max(1, limit * 2 // 3)]}
+    query = _terms(question)
+
+    def rank(node):
+        text = json.dumps({key: node.get(key) for key in
+                           ("statement", "scope", "predictions", "falsifiers", "unresolved")},
+                          ensure_ascii=False)
+        return (len(query & _terms(text)), node.get("scenario") == scenario,
+                node.get("updated_at", ""), node.get("revision", 1), node["id"])
+
+    direct_ids = {node["id"] for node in direct}
+    bridges = {}
     for link in state["links"]:
         if link["relation"] != "transfer_candidate" or not link.get("transfer_contract"):
             continue
         source, target = link["source"], link["target"]
         if source not in hypotheses or target not in hypotheses:
             continue
-        if source in chosen or target in chosen:
-            for key in (source, target):
-                if len(chosen) < limit:
-                    chosen.setdefault(key, hypotheses[key])
-    for node in direct:
-        if len(chosen) < limit:
-            chosen.setdefault(node["id"], node)
+        for anchor, neighbor in ((source, target), (target, source)):
+            if anchor in direct_ids and neighbor not in direct_ids:
+                bridges.setdefault(neighbor, []).append(hypotheses[anchor])
+    chosen = {}
+    eligible = direct + [hypotheses[key] for key in bridges]
+    for node in sorted(eligible, key=rank, reverse=True):
+        reading = [node]
+        if node["id"] in bridges:
+            reading.insert(0, max(bridges[node["id"]], key=rank))
+        additions = {card["id"]: card for card in reading if card["id"] not in chosen}
+        if len(chosen) + len(additions) <= limit:
+            chosen.update(additions)
     links = [_context_link(link) for link in state["links"]
              if link["source"] in chosen and link["target"] in chosen]
     evidence_ids = {key for node in chosen.values() for key in node.get("evidence_ids", [])}

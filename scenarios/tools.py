@@ -7,6 +7,7 @@ import atexit
 import importlib
 import json
 import math
+import subprocess
 from pathlib import Path
 import sys
 import types
@@ -27,6 +28,27 @@ _TOOL_METRICS = {
     "hea-reported-tensile-strength-lightgbm": ["reported_tensile_strength"],
     "hea-reported-elongation-lightgbm": ["reported_elongation"],
 }
+
+
+class PredictionError(RuntimeError):
+    """One inference failed; its missing result must not become evidence."""
+
+
+def _predict(function, *args, **kwargs):
+    """Translate known execution failures; native asset/contract errors stay fatal."""
+    try:
+        return function(*args, **kwargs)
+    except (ValueError, RuntimeError, OSError, ArithmeticError, subprocess.TimeoutExpired) as exc:
+        cause = exc.__cause__ or exc
+        message = str(cause)
+        execution_errors = ('TimeoutError:', 'FloatingPointError:', 'OverflowError:',
+                            'corrosion model worker timed out', 'plate predictor exited before response',
+                            'HEA runtime exited without a response', 'non-finite model prediction',
+                            'negative cumulative corrosion loss', 'predictor returned a non-finite value')
+        if (isinstance(cause, (TimeoutError, BrokenPipeError, ArithmeticError, subprocess.TimeoutExpired))
+                or any(error in message for error in execution_errors)):
+            raise PredictionError(str(exc)) from exc
+        raise
 
 
 def select_tools(scene, tool_ids=None):
@@ -124,7 +146,7 @@ def evaluate(scene, composition, protocol, workdir, *, tool_ids=None):
         if _CORROSION is None:
             _CORROSION = module.MaterialModelRuntime()
             atexit.register(_CORROSION.close)
-        raw["corrosion"] = _CORROSION.predict({
+        raw["corrosion"] = _predict(_CORROSION.predict, {
             "candidate_id": workdir.name, "composition_wt_pct": composition,
             "composition_complete": True, "protocol": protocol,
         })
@@ -144,7 +166,7 @@ def evaluate(scene, composition, protocol, workdir, *, tool_ids=None):
         actual = [module.nonmagnetic_tool_spec(target) for target, _ in requested]
         if {tool.tool_id: tool.version for tool in actual} != versions:
             raise ValueError("The registered nonmagnetic tool versions differ from the installed predictors")
-        raw["nonmagnetic"] = module.evaluate_nonmagnetic_candidate(
+        raw["nonmagnetic"] = _predict(module.evaluate_nonmagnetic_candidate,
             composition, protocol, targets=[native for _, native in requested])
         metrics.update(raw["nonmagnetic"]["metrics"])
         if any(target != "yield_strength" for target, _ in requested):
@@ -164,7 +186,7 @@ def evaluate(scene, composition, protocol, workdir, *, tool_ids=None):
             actual = module.binding(target) if target else module.binding()
             if (actual["tool_id"], actual["version"]) != (tool["id"], tool["version"]):
                 raise ValueError("The registered HEA tool version differs from its installed predictor")
-            raw[name] = getattr(module, function_name)(payload)
+            raw[name] = _predict(getattr(module, function_name), payload)
             metrics.update(raw[name]["metrics"])
             limitations.extend(raw[name].get("warnings", []))
             _save(workdir / f"{name}.json", raw[name])

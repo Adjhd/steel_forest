@@ -24,10 +24,11 @@ def arguments(argv=None):
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--evaluations', type=int, default=12, help='每轮成分设计评估上限；每点执行所有协议，0 表示只研究假设')
     parser.add_argument('--literature-queries', type=int, default=2, help='每轮文献问题数；每个服务每问最多请求3次，0 跳过检索')
-    parser.add_argument('--llm-calls', type=int, default=15, help='本批语言模型请求上限，不自动重试')
+    parser.add_argument('--llm-calls', type=int, default=15, help='本批语言模型请求上限，包含重试与输出纠正')
     parser.add_argument('--recommendations', type=int, default=3, help='本批至少交付的不同成分候选数；优先于自然语言中的数量描述')
     parser.add_argument('--prepare-only', action='store_true', help='仅装配输入，不读取森林、不调用模型与服务')
     parser.add_argument('--keep-private', action='store_true', help='保留研究结果，暂不合入canonical')
+    parser.add_argument('--allow-unreviewed', action='store_true', help='调试：允许复审预算不足时执行预测，结果仅保存为未审中间产物')
     return parser.parse_args(argv)
 
 
@@ -51,7 +52,8 @@ def configuration(args):
         raise ValueError('研究问题不能为空')
     return {'version': args.version, 'scenario': scene, 'question': question.strip(), 'space': space,
             'rounds': args.rounds, 'evaluations': args.evaluations, 'literature_queries': args.literature_queries,
-            'llm_calls': args.llm_calls, 'recommendations': args.recommendations, 'merge': not args.keep_private}
+            'llm_calls': args.llm_calls, 'recommendations': args.recommendations, 'merge': not args.keep_private,
+            'allow_unreviewed': args.allow_unreviewed}
 
 
 def write_report(output, config, result):
@@ -59,8 +61,8 @@ def write_report(output, config, result):
     report_dir = output.parent / 'reports' / config['version']
     batch_link = f'../../{quote(config["version"], safe="")}'
     delta = result['delta']
-    nodes = {node['id']: node for node in delta['nodes']}
-    evidence = {record['id']: record for record in delta['evidence']}
+    nodes = {node['id']: node for node in result['hypotheses'] + delta['nodes']}
+    evidence = {record['id']: record for record in result['hypothesis_evidence'] + delta['evidence']}
     selected = result['recommended_candidate_ids']
     lines = [f'# {config["scenario"]["name"]}候选报告', '',
              f'批次：`{config["version"]}`；状态：`{result["status"]}`。', '',
@@ -75,6 +77,8 @@ def write_report(output, config, result):
             lines.extend([f'文献检索缺口：第 {retrieval["round"]} 轮有 {len(retrieval["failures"])} 项服务查询未完成；本轮取得 {retrieval["records"]} 条线索。详见该轮 literature_requests.json，服务失败不代表没有相关文献。', ''])
     if not selected:
         lines.extend(['本批没有形成通过交付检查的最终推荐；中间候选保存在各轮目录中。', ''])
+    elif result['status'] != 'frozen_pending_measurement':
+        lines.extend(['以下保留已审查合格的部分成果；本批尚未完成全部研究要求。', ''])
     for candidate_id in selected:
         node = nodes[candidate_id]
         plan = nodes[node['plan_id']]

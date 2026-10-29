@@ -19,6 +19,10 @@ class ServiceError(RuntimeError):
         self.retryable = retryable
 
 
+class LLMOutputError(ServiceError):
+    """LLM 响应无法作为阶段答案使用，可请求重新生成；不保存响应正文。"""
+
+
 def _required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -45,12 +49,13 @@ def _post(url: str, key: str, payload: dict, *, service: str, timeout: float, pr
     except requests.RequestException as exc:
         transient = isinstance(exc, (requests.Timeout, requests.ConnectionError)) and not isinstance(exc, requests.exceptions.SSLError)
         raise ServiceError(f"{service} 网络请求失败：{type(exc).__name__}", retryable=transient) from None
+    output_error = LLMOutputError if service == "LLM" else ServiceError
     try:
         body = response.json()
     except ValueError:
-        raise ServiceError(f"{service} 未返回有效 JSON") from None
+        raise output_error(f"{service} 未返回有效 JSON") from None
     if not isinstance(body, dict):
-        raise ServiceError(f"{service} 的 JSON 顶层必须是对象")
+        raise output_error(f"{service} 的 JSON 顶层必须是对象")
     return body
 
 
@@ -82,7 +87,7 @@ def ask(system: str, payload: dict) -> dict:
     try:
         choice = response["choices"][0]
         if choice.get("finish_reason") == "length":
-            raise ServiceError("LLM 输出被截断；本阶段未完成")
+            raise LLMOutputError("LLM 输出被截断；请精简答案并返回完整 JSON 对象")
         content = choice["message"]["content"]
         if isinstance(content, list):
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
@@ -92,10 +97,11 @@ def ask(system: str, payload: dict) -> dict:
             if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
                 content = "\n".join(lines[1:-1])
         result = json.loads(content)
-    except (KeyError, IndexError, TypeError, ValueError):
-        raise ServiceError("LLM 未返回有效 JSON 对象；本阶段未完成") from None
+        json.dumps(result, allow_nan=False)  # 拒绝 NaN、Infinity 和数值解析溢出。
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        raise LLMOutputError("LLM 未返回有效 JSON 对象；请按阶段要求返回完整 JSON 对象") from None
     if not isinstance(result, dict):
-        raise ServiceError("LLM 输出顶层必须是 JSON 对象")
+        raise LLMOutputError("LLM 输出顶层必须是 JSON 对象")
     return result
 
 
